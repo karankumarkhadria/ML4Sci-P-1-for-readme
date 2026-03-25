@@ -1,0 +1,1044 @@
+CELL 0 TYPE:markdown
+# Linear Attention ViT Benchmark: Multi-Architecture Comparison for Particle Collision Images
+
+**GSoC ML4SCI Project** — Research-Grade Experimental Framework
+
+This notebook benchmarks three Vision Transformer architectures on particle collision detector images:
+1. **Standard ViT** — quadratic self-attention O(N²·d)
+2. **Linear Attention ViT** — Cross-Covariance Attention (XCA) O(N·d²) 
+3. **Hybrid CNN+ViT** — CNN backbone + transformer encoder
+
+Architecture diagrams: `../images/`
+====
+
+CELL 1 TYPE:markdown
+## Section 1: Configuration
+====
+
+CELL 2 TYPE:code
+# ============================================================
+# Section 1: Configuration
+# All hyperparameters in one place for reproducibility
+# ============================================================
+
+import os
+import random
+import time
+import warnings
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+warnings.filterwarnings("ignore")
+
+# ----------------------------------------------------------
+# Hyperparameters
+# ----------------------------------------------------------
+
+# Model
+IMG_SIZE = 64          # Input image resolution
+PATCH_SIZE = 8         # Patch size for tokenization
+IN_CHANS = 8           # Number of input channels (detector layers)
+EMBED_DIM = 256        # Transformer embedding dimension
+DEPTH = 10             # Number of transformer blocks
+NUM_HEADS = 8          # Number of attention heads
+MLP_RATIO = 4.0        # MLP hidden dim ratio
+DROPOUT = 0.1          # Dropout probability
+
+# Training
+BATCH_SIZE = 32
+EPOCHS = 20
+LR = 3e-4
+WEIGHT_DECAY = 1e-4
+TRAIN_FRAC = 0.80      # 80/20 train/val split
+SEED = 42
+REGRESSION_LAMBDA = 1.0  # Weight for regression (MSE) loss
+
+# Pretraining (MAE-style, not used in benchmark but kept for reference)
+PRETRAIN_EPOCHS = 30
+MASK_RATIO = 0.50
+LR_PRETRAIN = 1e-3
+
+# Data paths
+DATA_DIR = Path(r"C:\Users\Rahul\Desktop\AA Gsoc'26\data")
+UNLABELED_FILE = DATA_DIR / "Dataset_Specific_Unlabelled.h5"
+LABELED_FILE = DATA_DIR / "Dataset_Specific_labelled_full_only_for_2i.h5"
+
+NUM_CLASSES = 2  # quark vs gluon (or whatever the dataset has)
+
+
+# ----------------------------------------------------------
+# Device detection
+# ----------------------------------------------------------
+
+def get_device() -> torch.device:
+    """Auto-detect the best available compute device."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+DEVICE = get_device()
+print(f"Using device: {DEVICE}")
+if DEVICE.type == "cuda":
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+
+# ----------------------------------------------------------
+# Reproducibility — seed everything
+# ----------------------------------------------------------
+
+def seed_everything(seed: int = 42) -> None:
+    """Set all random seeds for full reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+seed_everything(SEED)
+print(f"Seeds set to {SEED}")
+print(f"PyTorch version: {torch.__version__}")
+---OUTPUTS---
+Using device: cuda
+GPU: NVIDIA GeForce RTX 4050 Laptop GPU
+GPU Memory: 6.4 GB
+Seeds set to 42
+PyTorch version: 2.3.0+cu121
+
+====
+
+CELL 3 TYPE:markdown
+## Section 2: Dataset Loading
+====
+
+CELL 4 TYPE:code
+# ============================================================
+# Section 3: Data Preprocessing & Augmentation
+# ============================================================
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import random
+
+
+# ============================================================
+# Physics Preprocessing
+# ============================================================
+
+class PhysicsPreprocess(nn.Module):
+
+    def __init__(self, img_size=64, in_chans=8):
+        super().__init__()
+        self.img_size = img_size
+        self.in_chans = in_chans
+
+    def forward(self, x):
+
+        # Convert to tensor
+        if not torch.is_tensor(x):
+            x = torch.tensor(x)
+
+        x = x.float()
+
+        # ------------------------------
+        # Fix image shape robustly
+        # ------------------------------
+
+        if x.ndim == 4:
+            x = x.squeeze(0)
+
+        if x.ndim == 1:
+            x = x.view(1,1,1)
+
+        if x.ndim == 2:
+            x = x.unsqueeze(0)
+
+        if x.ndim == 3:
+
+            # dataset format (H,W,C)
+            if x.shape[-1] == self.in_chans:
+                x = x.permute(2,0,1)
+
+        # guarantee 3D tensor
+        if x.ndim != 3:
+            x = x.reshape(1,x.shape[-2],x.shape[-1])
+
+        # ------------------------------
+        # Physics log scaling
+        # ------------------------------
+
+        x = torch.log1p(x.clamp(min=0))
+
+        # ------------------------------
+        # Normalization
+        # ------------------------------
+
+        xmin = x.min()
+        xmax = x.max()
+
+        if (xmax - xmin) > 1e-6:
+            x = (x - xmin)/(xmax - xmin)
+
+        # ------------------------------
+        # Resize safely
+        # ------------------------------
+
+        H,W = x.shape[-2:]
+
+        if H != self.img_size or W != self.img_size:
+
+            x = F.interpolate(
+                x.unsqueeze(0),
+                size=(self.img_size,self.img_size),
+                mode="bilinear",
+                align_corners=False
+            ).squeeze(0)
+
+        # ------------------------------
+        # Channel correction
+        # ------------------------------
+
+        C = x.shape[0]
+
+        if C < self.in_chans:
+
+            repeat = (self.in_chans + C - 1)//C
+            x = x.repeat(repeat,1,1)[:self.in_chans]
+
+        elif C > self.in_chans:
+
+            x = x[:self.in_chans]
+
+        return x
+
+
+# ============================================================
+# Data Augmentation
+# ============================================================
+
+class AugmentTransform(nn.Module):
+
+    def __init__(self,p=0.5,noise_std=0.01):
+        super().__init__()
+        self.p = p
+        self.noise_std = noise_std
+
+    def forward(self,x):
+
+        if random.random() < self.p:
+            k = random.randint(0,3)
+            x = torch.rot90(x,k,[1,2])
+
+        if random.random() < self.p:
+            x = torch.flip(x,[1])
+
+        if random.random() < self.p:
+  
+---OUTPUTS---
+Train samples: 8000
+Val samples: 2000
+Train batches: 250
+Val batches: 63
+
+Unlabeled samples
+
+Labeled validation samples
+
+====
+
+CELL 5 TYPE:markdown
+## Section 3: Data Preprocessing & Augmentation
+====
+
+CELL 6 TYPE:code
+# ============================================================
+# Section 3: Data Preprocessing & Augmentation
+# Physics-inspired transforms + optional augmentations
+# ============================================================
+
+import torchvision.transforms.functional as TF
+import matplotlib.pyplot as plt
+
+
+class PhysicsPreprocess(nn.Module):
+    """
+    Physics-inspired preprocessing pipeline for detector images.
+
+    Steps:
+    1. Log-compress: x = log(1 + x)  (handles wide energy dynamic range)
+    2. Per-image min-max normalization to [0, 1]
+    3. Resize to (img_size, img_size)
+    4. Ensure IN_CHANS channels (tile if fewer channels)
+    """
+
+    def __init__(self, img_size: int = 64, in_chans: int = 8):
+        super().__init__()
+        self.img_size = img_size
+        self.in_chans = in_chans
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (C, H, W)
+        # 1. Log-compress
+        x = torch.log1p(x.clamp(min=0.0))
+
+        # 2. Per-image min-max normalization
+        x_min = x.min()
+        x_max = x.max()
+        if x_max > x_min:
+            x = (x - x_min) / (x_max - x_min + 1e-8)
+        else:
+            x = torch.zeros_like(x)
+
+        # 3. Resize spatial dimensions
+        if x.shape[-1] != self.img_size or x.shape[-2] != self.img_size:
+            x = TF.resize(x, [self.img_size, self.img_size], antialias=True)
+
+        # 4. Ensure correct number of channels
+        c = x.shape[0]
+        if c < self.in_chans:
+            repeats = (self.in_chans + c - 1) // c
+            x = x.repeat(repeats, 1, 1)[: self.in_chans]
+        elif c > self.in_chans:
+            x = x[: self.in_chans]
+
+        return x
+
+
+class AugmentTransform(nn.Module):
+    """
+    Optional data augmentation for detector images.
+
+    Augmentations:
+    - Random 90° rotation increments
+    - Random horizontal/vertical flips
+    - Gaussian noise injection (σ=0.01)
+
+    All are applied with 50% probability.
+    """
+
+    def __init__(self, p: float = 0.5, noise_std: float = 0.01):
+        super().__init__()
+        self.p = p
+        self.noise_std = noise_std
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if random.random() < self.p:
+            k = random.randint(0, 3)
+            x = torch.rot90(x, k, dims=[-2, -1])
+        if random.random() < self.p:
+            x = TF.hflip(x)
+        if random.random() < self.p:
+            x = TF.vflip(x)
+        if random.random() < self.p:
+            x = x + torch.randn_like(x) * self.noise_std
+            x = x.clamp(0.0, 1.0)
+        return x
+
+
+class TrainTransform(nn.Module):
+    """Combined preprocessing + augmentation for training."""
+    def __init__(self, img_size=64, in_chans=8):
+        super().__init__()
+        self.preprocess = PhysicsPreprocess(img_size, in_chans)
+        self.augment = AugmentTransform()
+
+    def forward(self, x):
+        return self.augment(self.preprocess(x))
+
+
+class ValTransform(nn.Module):
+    """Preprocessing only (no augmentation) for validation/
+---OUTPUTS---
+Train samples: 8000 | Val samples: 2000
+Train batches: 250 | Val batches: 63
+
+--- Unlabeled samples (log-compressed, ch 0) ---
+
+--- Labeled validation samples (log-compressed, ch 0) ---
+
+====
+
+CELL 7 TYPE:markdown
+## Section 4: Model Architectures
+
+Three architectures are compared:
+
+| Model | Attention | Complexity | Description |
+|-------|-----------|------------|-------------|
+| **StandardViT** | Softmax self-attn | O(N²·d) | Classic ViT with learnable pos. embeddings |
+| **LinearAttentionViT** | Cross-Covariance (XCA) | O(N·d²) | XCiT-style linear attention with LPI |
+| **HybridCNNViT** | CNN + Softmax | Mixed | CNN stem tokenizes, transformer refines |
+
+All three share: EMBED_DIM=256, NUM_HEADS=8, DEPTH=10, stochastic depth decay [0→0.1].
+
+Architecture reference diagrams: `../images/`
+====
+
+CELL 8 TYPE:code
+# ============================================================
+# Section 4: Model Architectures
+# StandardViT, LinearAttentionViT, HybridCNNViT
+# ============================================================
+
+import math
+from functools import partial
+
+import torch.nn.functional as F
+
+
+# ----------------------------------------------------------
+# Shared building blocks
+# ----------------------------------------------------------
+
+class DropPath(nn.Module):
+    """
+    Stochastic Depth (Drop Path) regularization for deep networks.
+
+    Randomly drops entire residual branches during training,
+    equivalent to training an ensemble of shallower networks.
+
+    Reference: "Deep Networks with Stochastic Depth" (Huang et al., 2016)
+    """
+
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor = torch.floor(random_tensor + keep_prob)
+        return x * random_tensor / keep_prob
+
+
+class PatchEmbed(nn.Module):
+    """
+    Image-to-patch embedding using a strided convolution.
+
+    Splits the image into non-overlapping patches and projects each
+    patch to EMBED_DIM via a single Conv2d (equivalent to a linear
+    projection of flattened patches).
+
+    Parameters
+    ----------
+    img_size : int
+        Input image resolution (assumed square).
+    patch_size : int
+        Patch edge length in pixels.
+    in_chans : int
+        Number of input image channels.
+    embed_dim : int
+        Output embedding dimension.
+    """
+
+    def __init__(self, img_size=64, patch_size=8, in_chans=8, embed_dim=256):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.n_patches = (img_size // patch_size) ** 2
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, H, W) -> (B, N, D)
+        x = self.proj(x)                          # (B, D, H/P, W/P)
+        x = x.flatten(2).transpose(1, 2)          # (B, N, D)
+        return x
+
+
+class MLP(nn.Module):
+    """
+    Two-layer feed-forward network with GELU activation and dropout.
+
+    Used inside transformer blocks (FFN / MLP sublayer).
+    """
+
+    def __init__(self, in_features: int, hidden_features: int = None, dropout: float = 0.0):
+        super().__init__()
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_features, in_features)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc1(x)
+      
+====
+
+CELL 9 TYPE:markdown
+## Section 5: Training Utilities
+====
+
+CELL 10 TYPE:code
+# ============================================================
+# Section 5: Training Utilities
+# Mixed-precision training, evaluation, early stopping,
+# cosine LR scheduling, and model checkpointing
+# ============================================================
+
+import copy
+from tqdm.auto import tqdm
+from torch.cuda.amp import GradScaler, autocast
+
+
+# ----------------------------------------------------------
+# Loss function
+# ----------------------------------------------------------
+
+def compute_loss(
+    mass_pred: torch.Tensor,
+    mass_true: torch.Tensor,
+    class_logits: torch.Tensor,
+    class_true: torch.Tensor,
+    regression_weight: float = REGRESSION_LAMBDA,
+) -> tuple:
+    """
+    Combined classification + regression loss.
+
+    Total Loss = CrossEntropy(class) + regression_weight * MSE(mass)
+
+    Parameters
+    ----------
+    mass_pred : Tensor (B, 1)
+    mass_true : Tensor (B,)
+    class_logits : Tensor (B, num_classes)
+    class_true : Tensor (B,) of dtype long
+    regression_weight : float
+
+    Returns
+    -------
+    total_loss, mse_loss, ce_loss (all scalar Tensors)
+    """
+    mse = F.mse_loss(mass_pred.squeeze(1), mass_true)
+    ce = F.cross_entropy(class_logits, class_true)
+    total = ce + regression_weight * mse
+    return total, mse, ce
+
+
+# ----------------------------------------------------------
+# Training epoch
+# ----------------------------------------------------------
+
+def train_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    regression_weight: float = REGRESSION_LAMBDA,
+) -> dict:
+    """
+    Run one training epoch with mixed precision (AMP) and gradient clipping.
+
+    Parameters
+    ----------
+    model : nn.Module
+    loader : DataLoader  (yields img, mass, label)
+    optimizer : torch.optim.Optimizer
+    scaler : GradScaler  (for AMP; ignored gracefully on CPU)
+    regression_weight : float  (λ for MSE loss)
+
+    Returns
+    -------
+    dict with keys: loss, mse, ce  (epoch averages)
+    """
+    model.train()
+    total_loss = total_mse = total_ce = 0.0
+    n_batches = len(loader)
+
+    for imgs, masses, labels in tqdm(loader, desc="  train", leave=False):
+        imgs = imgs.to(DEVICE)
+        masses = masses.to(DEVICE)
+        labels = labels.to(DEVICE)
+
+        optimizer.zero_grad()
+
+        # Mixed precision forward pass
+        with autocast(device_type=DEVICE.type, enabled=(DEVICE.type == "cuda")):
+            mass_pred, class_logits = model(imgs)
+            loss, mse, ce = compute_loss(mass_pred, masses, class_logits, labels, regression_weight)
+
+        # Backward + gradient clipping + optimizer step
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_loss += loss.item()
+        total_mse += mse.item()
+        total_ce += ce.item()
+
+    return {"loss": total_loss / n_batches, "mse"
+====
+
+CELL 11 TYPE:markdown
+## Section 6: Evaluation Metrics
+====
+
+CELL 12 TYPE:code
+# ============================================================
+# Section 6: Evaluation Metrics
+# Full suite of classification + regression metrics
+# ============================================================
+
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    confusion_matrix,
+    mean_squared_error,
+    mean_absolute_error,
+    r2_score,
+)
+
+
+def compute_metrics(eval_results: dict) -> dict:
+    """
+    Compute comprehensive classification and regression metrics.
+
+    Parameters
+    ----------
+    eval_results : dict
+        Output of evaluate_model(). Must have keys:
+        mass_pred, mass_true, class_pred, class_true.
+
+    Returns
+    -------
+    dict with keys:
+        accuracy, f1, precision, recall, confusion_matrix  (classification)
+        mse, mae, r2                                        (regression)
+    """
+    y_true = eval_results["class_true"]
+    y_pred = eval_results["class_pred"]
+    m_true = eval_results["mass_true"]
+    m_pred = eval_results["mass_pred"]
+
+    metrics = {
+        # Classification
+        "accuracy": accuracy_score(y_true, y_pred),
+        "f1": f1_score(y_true, y_pred, average="macro", zero_division=0),
+        "precision": precision_score(y_true, y_pred, average="macro", zero_division=0),
+        "recall": recall_score(y_true, y_pred, average="macro", zero_division=0),
+        "confusion_matrix": confusion_matrix(y_true, y_pred),
+        # Regression
+        "mse": mean_squared_error(m_true, m_pred),
+        "mae": mean_absolute_error(m_true, m_pred),
+        "r2": r2_score(m_true, m_pred),
+    }
+    return metrics
+
+
+def print_metrics(metrics: dict, title: str = "Metrics") -> None:
+    """Pretty-print a metrics dictionary."""
+    print(f"\n{'='*50}")
+    print(f"  {title}")
+    print(f"{'='*50}")
+    print(f"  Classification:")
+    print(f"    Accuracy  : {metrics['accuracy']:.4f}")
+    print(f"    F1 (macro): {metrics['f1']:.4f}")
+    print(f"    Precision : {metrics['precision']:.4f}")
+    print(f"    Recall    : {metrics['recall']:.4f}")
+    print(f"  Regression:")
+    print(f"    MSE       : {metrics['mse']:.4f}")
+    print(f"    MAE       : {metrics['mae']:.4f}")
+    print(f"    R²        : {metrics['r2']:.4f}")
+    print(f"{'='*50}")
+
+
+print("Metrics functions defined: compute_metrics(), print_metrics()")
+====
+
+CELL 13 TYPE:markdown
+## Section 7: Visualization Tools
+====
+
+CELL 14 TYPE:code
+# ============================================================
+# Section 7: Visualization Tools
+# Plotting functions for training curves, metrics, and images
+# ============================================================
+
+import seaborn as sns
+import pandas as pd
+
+plt.rcParams.update({
+    "figure.dpi": 100,
+    "axes.titlesize": 12,
+    "axes.labelsize": 10,
+    "font.size": 10,
+})
+
+
+def plot_training_curves(history: dict, title: str = "Training Curves") -> None:
+    """
+    Plot loss and accuracy vs epoch for a single model.
+
+    Parameters
+    ----------
+    history : dict
+        Keys: train_loss, val_loss, val_acc (lists, one value per epoch).
+    title : str
+        Figure title.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    epochs = range(1, len(history["train_loss"]) + 1)
+
+    axes[0].plot(epochs, history["train_loss"], label="Train Loss", linewidth=2)
+    axes[0].plot(epochs, history["val_loss"], label="Val Loss", linewidth=2, linestyle="--")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[0].set_title(f"{title} — Loss")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(epochs, history["val_acc"], label="Val Accuracy", linewidth=2, color="green")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Accuracy")
+    axes[1].set_title(f"{title} — Validation Accuracy")
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_mass_scatter(
+    true_mass: np.ndarray,
+    pred_mass: np.ndarray,
+    title: str = "Mass Prediction",
+) -> None:
+    """
+    Scatter plot of true vs predicted particle mass with R² annotation.
+
+    Parameters
+    ----------
+    true_mass : array (N,)
+    pred_mass : array (N,)
+    title : str
+    """
+    r2 = r2_score(true_mass, pred_mass)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.scatter(true_mass, pred_mass, alpha=0.3, s=10, edgecolors="none")
+    lims = [min(true_mass.min(), pred_mass.min()), max(true_mass.max(), pred_mass.max())]
+    ax.plot(lims, lims, "r--", linewidth=1.5, label="Perfect prediction")
+    ax.set_xlabel("True Mass")
+    ax.set_ylabel("Predicted Mass")
+    ax.set_title(f"{title}\n$R^2 = {r2:.4f}$")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_confusion_matrix(
+    cm: np.ndarray,
+    class_names: list = None,
+    title: str = "Confusion Matrix",
+) -> None:
+    """
+    Heatmap of the confusion matrix using seaborn.
+
+    Parameters
+    ----------
+    cm : array (n_classes, n_classes)
+    class_names : list of str
+    title : str
+    """
+    if class_names is None:
+        class_names = [str(i) for i in range(len(cm))]
+    fig, ax = plt.subplots(figsize=(5, 4))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=class_names,
+        yticklabels=class_names,
+        ax=ax,
+    )
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title(title)
+    plt.tight_layout(
+====
+
+CELL 15 TYPE:markdown
+## Section 8: Experiments
+
+Each of the three models is trained with **identical** hyperparameters:
+- Optimizer: AdamW (lr=3e-4, weight_decay=1e-4)
+- Scheduler: CosineAnnealingLR over EPOCHS
+- Loss: CE + λ·MSE (λ=1.0)
+- Same 80/20 train/val split
+- Mixed precision training (CUDA) or standard (CPU/MPS)
+- Early stopping (patience=5, monitors val MSE)
+====
+
+CELL 16 TYPE:code
+# ============================================================
+# Section 8: Experiments
+# Full training pipeline for each architecture
+# ============================================================
+
+import gc
+import tempfile
+
+
+def run_experiment(
+    model_class,
+    model_name: str,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    epochs: int = EPOCHS,
+    lr: float = LR,
+    weight_decay: float = WEIGHT_DECAY,
+    regression_weight: float = REGRESSION_LAMBDA,
+    patience: int = 5,
+) -> dict:
+    """
+    Full training pipeline for a single model architecture.
+
+    Steps:
+    1. Instantiate model and move to DEVICE
+    2. Setup AdamW optimizer + CosineAnnealingLR scheduler
+    3. Train for `epochs` with mixed precision, early stopping,
+       and best-model checkpointing (based on val MSE)
+    4. Load best checkpoint and run final evaluation
+    5. Return results dict with all metrics and histories
+
+    Parameters
+    ----------
+    model_class : type  (StandardViT, LinearAttentionViT, or HybridCNNViT)
+    model_name : str    display name for logging
+    train_loader, val_loader : DataLoader
+    epochs : int
+    lr : float          learning rate
+    weight_decay : float
+    regression_weight : float  λ for MSE loss
+    patience : int      early stopping patience
+
+    Returns
+    -------
+    dict with keys: model_name, history, final_metrics, train_time, params,
+                    peak_gpu_mem_gb
+    """
+    print(f"\n{'='*60}")
+    print(f"  Experiment: {model_name}")
+    print(f"{'='*60}")
+
+    seed_everything(SEED)  # Same initialization for fairness
+    model = model_class().to(DEVICE)
+    params = model.count_params()
+    print(f"  Parameters: {params:,} ({params/1e6:.2f}M)")
+    print(f"  Device: {DEVICE}")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    scaler = GradScaler(enabled=(DEVICE.type == "cuda"))
+    early_stopper = EarlyStopping(patience=patience)
+
+    # Checkpointing: save best model state to a temp file
+    best_state = None
+    best_val_mse = float("inf")
+
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+        "val_mse": [],
+        "val_acc": [],
+        "lr": [],
+    }
+
+    start_time = time.time()
+    if DEVICE.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(DEVICE)
+
+    for epoch in range(1, epochs + 1):
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        # --- Train ---
+        train_stats = train_epoch(model, train_loader, optimizer, scaler, regression_weight)
+
+        # --- Evaluate ---
+        val_results = evaluate_model(model, val_loader)
+        val_metrics = compute_metrics(val_results)
+
+        # --- Scheduler step ---
+        scheduler.step()
+
+        # --- Logging ---
+        history["train_loss"].append(train_stats["loss"])
+        history["val_loss"].append(val_results["loss"])
+        history["val_mse"].append(val_m
+====
+
+CELL 17 TYPE:markdown
+## Section 9: Benchmark Comparison
+
+Aggregated results across all three architectures.
+====
+
+CELL 18 TYPE:code
+# ============================================================
+# Section 9: Benchmark Comparison
+# Summary table + comparison plots
+# ============================================================
+
+# ----------------------------------------------------------
+# Comparison DataFrame
+# ----------------------------------------------------------
+
+rows = []
+for name, res in all_results.items():
+    m = res["final_metrics"]
+    rows.append({
+        "Model": name,
+        "Accuracy": f"{m['accuracy']:.4f}",
+        "F1": f"{m['f1']:.4f}",
+        "MSE": f"{m['mse']:.4f}",
+        "MAE": f"{m['mae']:.4f}",
+        "R²": f"{m['r2']:.4f}",
+        "Train Time (s)": f"{res['train_time']:.1f}",
+        "Parameters": f"{res['params']:,}",
+    })
+
+df = pd.DataFrame(rows).set_index("Model")
+print("\n" + "="*90)
+print("Benchmark Comparison Table")
+print("="*90)
+print(df.to_string())
+print("="*90)
+
+# ----------------------------------------------------------
+# Comparison plots
+# ----------------------------------------------------------
+
+# 1. Training loss curves (all 3 overlaid)
+print("\n--- Comparison: Training Loss ---")
+plot_comparison_curves(
+    {name: res["history"] for name, res in all_results.items()},
+    metric_name="train_loss",
+)
+
+# 2. Validation accuracy curves (all 3 overlaid)
+print("--- Comparison: Validation Accuracy ---")
+plot_comparison_curves(
+    {name: res["history"] for name, res in all_results.items()},
+    metric_name="val_acc",
+)
+
+# 3. Mass scatter plots (one per model in a row)
+print("--- Mass Prediction Scatter Plots ---")
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+for ax, (name, res) in zip(axes, all_results.items()):
+    fr = res["final_results"]
+    r2 = res["final_metrics"]["r2"]
+    ax.scatter(fr["mass_true"], fr["mass_pred"], alpha=0.3, s=8, edgecolors="none")
+    lims = [
+        min(fr["mass_true"].min(), fr["mass_pred"].min()),
+        max(fr["mass_true"].max(), fr["mass_pred"].max()),
+    ]
+    ax.plot(lims, lims, "r--", linewidth=1.5)
+    ax.set_xlabel("True Mass")
+    ax.set_ylabel("Pred. Mass")
+    ax.set_title(f"{name}\n$R^2={r2:.4f}$")
+    ax.grid(True, alpha=0.3)
+plt.suptitle("Mass Prediction: True vs Predicted", fontsize=13, fontweight="bold", y=1.02)
+plt.tight_layout()
+plt.show()
+
+# 4. Confusion matrices (one per model in a row)
+print("--- Confusion Matrices ---")
+class_names = [str(i) for i in range(NUM_CLASSES)]
+fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+for ax, (name, res) in zip(axes, all_results.items()):
+    cm = res["final_metrics"]["confusion_matrix"]
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=class_names, yticklabels=class_names, ax=ax)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title(f"{name}")
+plt.suptitle("Confusion Matrices", fontsize=13, fontweight="bold")
+plt.tight_layout()
+plt.show()
+
+# 5. Bar chart comparing key metrics
+print("--- Metric Bar Charts ---")
+metric_keys = ["accuracy", "f1", "r2"]
+fig, axes = plt.subplots(1, len(metri
+====
+
+CELL 19 TYPE:markdown
+## Section 10: Final Results & Conclusions
+====
+
+CELL 20 TYPE:code
+# ============================================================
+# Section 10: Final Results & Conclusions
+# ============================================================
+
+# Print summary table once more
+print("\n" + "="*90)
+print("FINAL BENCHMARK RESULTS")
+print("="*90)
+print(df.to_string())
+print("="*90)
+
+# Determine best model per metric
+best_acc_model = max(all_results, key=lambda n: all_results[n]["final_metrics"]["accuracy"])
+best_r2_model = max(all_results, key=lambda n: all_results[n]["final_metrics"]["r2"])
+fastest_model = min(all_results, key=lambda n: all_results[n]["train_time"])
+smallest_model = min(all_results, key=lambda n: all_results[n]["params"])
+
+print(f"\n  Best Classification Accuracy : {best_acc_model}")
+print(f"  Best Regression R²           : {best_r2_model}")
+print(f"  Fastest Training             : {fastest_model}")
+print(f"  Smallest Model               : {smallest_model}")
+====
+
+CELL 21 TYPE:markdown
+## Analysis & Discussion
+
+### Linear Attention Efficiency vs. Accuracy
+
+The **Linear Attention ViT** (XCA-based) achieves O(N·d²) complexity per layer compared to O(N²·d) for standard attention. For this task with N=64 tokens (8×8 patches from a 64×64 image) and d=32 (head dimension), this represents a theoretical speedup when N > d. In practice at 64×64 resolution the two approaches are roughly comparable, but at higher resolutions (e.g., 256×256 with small patches) linear attention would show a significant advantage.
+
+### Hybrid CNN+ViT Benefits
+
+The **Hybrid CNN+ViT** combines the inductive biases of CNNs (translation equivariance, local feature hierarchies) with the global context modeling of transformers. This is particularly beneficial for particle detector images where local energy deposits carry important information. The CNN stem effectively reduces the spatial resolution before the transformer, resulting in fewer tokens and faster attention.
+
+### Recommendation for Particle Physics
+
+- For **production inference** at scale: Linear Attention ViT offers the best efficiency
+- For **maximum accuracy**: Hybrid CNN+ViT leverages domain-appropriate local feature extraction  
+- For **simplicity and interpretability**: Standard ViT serves as the baseline
+
+### Limitations & Future Work
+
+- Experiments were run on synthetic / small data; real CMS jet images may yield different relative rankings
+- Pretraining with masked autoencoders (MAE) could significantly boost all three models
+- Architecture search over depth, width, and patch size is recommended
+- Consider adding cross-attention between modalities or energy-weighted attention mechanisms
+
+### References
+
+- **ViT**: Dosovitskiy et al., *"An Image is Worth 16×16 Words"*, ICLR 2021
+- **XCiT**: El-Nouby et al., *"XCiT: Cross-Covariance Image Transformers"*, NeurIPS 2021  
+- **L2ViT**: Zheng, *"The Linear Attention Resurrection in Vision Transformer"*, arXiv:2501.16182, 2025
+- **MAE**: He et al., *"Masked Autoencoders Are Scalable Vision Learners"*, CVPR 2022
+====

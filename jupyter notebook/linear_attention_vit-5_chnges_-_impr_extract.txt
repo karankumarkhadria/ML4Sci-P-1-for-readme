@@ -1,0 +1,1922 @@
+CELL 0 TYPE:markdown
+# Linear Attention ViT Pipeline for Particle Collision Images
+
+**GSoC ML4SCI Project** -- Project-Requirement Aligned Notebook
+
+This notebook is aligned to the required task flow:
+1. **Pretrain Linear Attention ViT encoder** on unlabeled detector images using three SSL methods: **SimMIM, MAE, MAEv2**
+2. **Save separate pretrained encoder weights** for each SSL method
+3. **Fine-tune Linear Attention ViT** (low learning rate) from each pretrained encoder on labeled data
+4. **Train the same Linear Attention ViT from scratch** under matched settings
+5. **Compare SimMIM/MAE/MAEv2-pretrained vs scratch** using classification + regression metrics
+
+Primary architecture for the required path:
+- **Linear Attention ViT** -- ReLU/positive-kernel linear attention, O(N*d^2) in tokens
+
+Secondary baselines (optional for broader benchmarking):
+- Standard ViT, L2ViT, XCiT ViT
+
+Architecture diagrams: `../images/`
+
+---
+
+### Changelog (Alignment + Stability)
+
+| Change | Why |
+|--------|-----|
+| Requirement-first narrative (pretrain -> fine-tune -> scratch) | Matches project/mentor task description exactly |
+| Linear-attention modular SSL classes in Section 5 | Keeps architecture and SSL implementation consistent |
+| NaN-safe attention/loss guards | Prevents unstable pretraining loss explosions in notebook runs |
+| Backward-compatible class aliases (`*Pretrainer`) | Keeps existing training/eval code unchanged |
+| Existing loops/data/eval left untouched | Preserves reproducibility of your original workflow |
+
+**How to run:**
+- **Quick sanity test:** Set `RUN_MODE = "debug"` in Section 1, then Run All.
+- **Full required experiment:** Set `RUN_MODE = "full"`, run Section 9 -> Section 10 -> Section 11.
+- **Reporting:** Use benchmark and summary sections to compare SimMIM/MAE/MAEv2-pretrained vs scratch and baselines.
+====
+
+CELL 1 TYPE:markdown
+## Section 1: Configuration
+====
+
+CELL 2 TYPE:code
+# ============================================================
+# Section 1: Configuration
+# All hyperparameters in one place for reproducibility
+# ============================================================
+#
+# --- v2 changes ---
+# • Added STRICT_DETERMINISM toggle (default False)
+# • Added RUN_MODE ("debug" / "full") for quick sanity vs full run
+# • Added USE_AMP, USE_EMA toggles (both default False for notebook stability)
+# • Added LAMBDA_REG, USE_HUBER_LOSS, TWO_PHASE_TRAINING config
+# • DataLoader defaults: num_workers=0, pin_memory=False
+# ============================================================
+
+import os
+import random
+import time
+import warnings
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+warnings.filterwarnings("ignore")
+
+# ----------------------------------------------------------
+# Run mode: "full" (production training) or "debug" (2 epochs, fast sanity check)
+# ----------------------------------------------------------
+RUN_MODE = "full"
+
+# ----------------------------------------------------------
+# Determinism control
+# ----------------------------------------------------------
+# STRICT_DETERMINISM = True requires:
+#   - Setting env var CUBLAS_WORKSPACE_CONFIG=:4096:8 BEFORE launching Python
+#   - A kernel restart after changing this flag
+# Default False avoids CUBLAS workspace errors on Windows / Jupyter.
+STRICT_DETERMINISM = False
+
+# ----------------------------------------------------------
+# Hyperparameters
+# ----------------------------------------------------------
+
+# Model
+IMG_SIZE = 64          # Input image resolution
+PATCH_SIZE = 8         # Patch size for tokenization
+IN_CHANS = 8           # Number of input channels (detector layers)
+EMBED_DIM = 256        # Transformer embedding dimension
+DEPTH = 10             # Number of transformer blocks
+NUM_HEADS = 8          # Number of attention heads
+MLP_RATIO = 4.0        # MLP hidden dim ratio
+DROPOUT = 0.1          # Dropout probability
+
+# Training
+BATCH_SIZE = 32
+EPOCHS = 35
+LR = 3e-4
+WEIGHT_DECAY = 1e-4
+TRAIN_FRAC = 0.80      # 80/20 train/val split
+SEED = 42
+LAMBDA_REG = 0.2       # Weight for regression loss (was 1.0; 0.2 focuses on classification)
+REGRESSION_LAMBDA = LAMBDA_REG  # backward compat alias
+GRAD_CLIP_NORM = 1.0   # Max gradient norm for clipping
+
+# Loss options
+USE_HUBER_LOSS = True   # SmoothL1 (Huber) — robust to mass outliers
+
+# AMP & EMA
+USE_AMP = False         # Set True for GPU speed-up (may cause dtype issues in notebook)
+USE_EMA = False         # Exponential Moving Average of model weights
+
+# Early stopping
+ES_PATIENCE = 7         # Patience for early stopping on val macro-F1
+
+# Two-phase training (OFF by default)
+TWO_PHASE_TRAINING = True
+PHASE_A_EPOCHS = 7      # freeze encoder; warm up heads only
+PHASE_A_LAMBDA = 0.0    # regression weight during Phase A
+
+# Logging
+LOG_EVERY_N_BATCHES = 50  # Print batch progress every N batches (0 = off)
+
+# Pretraining
+PRETRAIN_EPOCHS = 20
+MASK_RATIO = 0.50
+LR_PRETRAIN = 1e-
+---OUTPUTS---
+Using device: cuda
+GPU: NVIDIA GeForce RTX 4050 Laptop GPU
+GPU Memory: 6.4 GB
+Seeds set to 42 | STRICT_DETERMINISM=False
+RUN_MODE=full | EPOCHS=35 | PRETRAIN_EPOCHS=20
+BATCH_SIZE=32 | LR=0.0003 | WEIGHT_DECAY=0.0001
+LAMBDA_REG=0.2 | USE_AMP=False | USE_EMA=False
+PyTorch version: 2.3.0+cu121
+
+====
+
+CELL 3 TYPE:markdown
+## Section 2: Dataset Loading
+====
+
+CELL 4 TYPE:code
+# ============================================================
+# Section 2: Dataset Loading (HDF5 ONLY, no synthetic fallback)
+# ============================================================
+
+import h5py
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+
+def inspect_hdf5(filepath: str) -> None:
+    """Print HDF5 structure, shapes, dtypes, and sample unique values for 1D datasets."""
+    print(f"\n=== HDF5 File: {filepath} ===")
+    with h5py.File(filepath, "r") as f:
+        def _print_tree(name, obj):
+            indent = "  " * name.count("/")
+            if hasattr(obj, "shape"):
+                msg = f"{indent}{name}: shape={obj.shape}, dtype={obj.dtype}"
+                if len(obj.shape) == 1 and obj.shape[0] > 0:
+                    sample = np.asarray(obj[: min(50, obj.shape[0])]).reshape(-1)
+                    msg += f", sample_unique={np.unique(sample)}"
+                print(msg)
+            else:
+                print(f"{indent}{name}/")
+        f.visititems(_print_tree)
+
+
+class LazyHDF5Dataset(Dataset):
+    """
+    Lazy-loading HDF5 dataset for particle collision images.
+    Requires valid keys for labeled data (mass + label).
+    """
+
+    def __init__(
+        self,
+        filepath,
+        labeled: bool = True,
+        transform=None,
+        img_key: str = None,
+        mass_key: str = None,
+        label_key: str = None,
+    ):
+        self.filepath = str(filepath)
+        self.labeled = labeled
+        self.transform = transform
+        self._file = None  # lazy handle
+
+        with h5py.File(self.filepath, "r") as f:
+            keys = list(f.keys())
+
+            # -----------------------
+            # Resolve image key
+            # -----------------------
+            if img_key is not None:
+                if img_key not in keys:
+                    raise ValueError(f"img_key='{img_key}' not found. Available keys: {keys}")
+                self.img_key = img_key
+            else:
+                preferred_img = ["jet", "X", "images", "image", "data", "X_jets", "jet_images", "jets"]
+                self.img_key = None
+                for k in preferred_img:
+                    if k in keys and hasattr(f[k], "shape") and len(f[k].shape) >= 3:
+                        self.img_key = k
+                        break
+                if self.img_key is None:
+                    for k in keys:
+                        obj = f[k]
+                        if hasattr(obj, "shape") and len(obj.shape) >= 3 and obj.shape[0] > 1:
+                            self.img_key = k
+                            break
+                if self.img_key is None:
+                    raise ValueError(f"No image-like key found in {self.filepath}. Keys={keys}")
+
+            self.length = int(f[self.img_key].shape[0])
+
+            # -----------------------
+            # Resolve labeled keys
+            # -----------------------
+            self.mass_key = None
+            self.label_key = None
+
+            if self.labeled:
+                # mas
+---OUTPUTS---
+
+--- Loading Datasets (HDF5 only) ---
+Found labeled file: C:\Users\Rahul\Desktop\AA Gsoc'26\data\Dataset_Specific_labelled_full_only_for_2i.h5
+
+=== HDF5 File: C:\Users\Rahul\Desktop\AA Gsoc'26\data\Dataset_Specific_labelled_full_only_for_2i.h5 ===
+Y: shape=(10000, 1), dtype=float32
+jet: shape=(10000, 125, 125, 8), dtype=float32
+m: shape=(10000, 1), dtype=float32
+pT: shape=(10000, 1), dtype=float32
+
+Found unlabeled file: C:\Users\Rahul\Desktop\AA Gsoc'26\data\Dataset_Specific_Unlabelled.h5
+
+=== HDF5 File: C:\Users\Rahul\Desktop\AA Gsoc'26\data\Dataset_Specific_Unlabelled.h5 ===
+jet: shape=(60000, 125, 125, 8), dtype=float32
+[LazyHDF5Dataset] file=C:\Users\Rahul\Desktop\AA Gsoc'26\data\Dataset_Specific_labelled_full_only_for_2i.h5
+  img_key=jet
+  mass_key=m, label_key=Y, pt_key=pT
+[LazyHDF5Dataset] file=C:\Users\Rahul\Desktop\AA Gsoc'26\data\Dataset_Specific_Unlabelled.h5
+  img_key=jet
+
+Labeled dataset size: 10000
+Unlabeled dataset size: 60000
+USING_SYNTHETIC = False
+
+====
+
+CELL 5 TYPE:markdown
+## Section 3: Data Preprocessing & Augmentation
+====
+
+CELL 6 TYPE:code
+# ============================================================
+# Section 3: Data Preprocessing & Augmentation (IMPROVED)
+# - Energy centroid alignment
+# - Safer physics-aware augmentation
+# - Per-channel normalization
+# - Safer mass normalization (explicit args)
+# ============================================================
+
+import math
+import random
+import warnings
+from collections import Counter
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, random_split
+import torchvision.transforms.functional as TF
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# Physics Preprocessing
+# ============================================================
+
+class PhysicsPreprocess(nn.Module):
+    """Physics-inspired preprocessing for detector images."""
+
+    def __init__(self, img_size: int = 64, in_chans: int = 8, allow_fallback_zeros: bool = True):
+        super().__init__()
+        self.img_size = int(img_size)
+        self.in_chans = int(in_chans)
+        self.allow_fallback_zeros = allow_fallback_zeros
+
+        y_coords, x_coords = torch.meshgrid(
+            torch.arange(self.img_size, dtype=torch.float32),
+            torch.arange(self.img_size, dtype=torch.float32),
+            indexing="ij",
+        )
+        self.register_buffer("x_coords", x_coords, persistent=False)
+        self.register_buffer("y_coords", y_coords, persistent=False)
+
+    def _fallback_image(self, device, dtype):
+        return torch.zeros((self.in_chans, self.img_size, self.img_size), device=device, dtype=dtype)
+
+    def _to_chw(self, x: torch.Tensor) -> torch.Tensor:
+        if not torch.is_tensor(x):
+            x = torch.as_tensor(x)
+        x = x.float()
+
+        if x.ndim == 0:
+            if self.allow_fallback_zeros:
+                warnings.warn("PhysicsPreprocess: scalar input encountered; using zeros fallback.")
+                return self._fallback_image(x.device, x.dtype)
+            raise ValueError(f"Expected image-like tensor, got scalar: {x}")
+
+        if x.ndim == 1 and x.numel() <= 1:
+            if self.allow_fallback_zeros:
+                warnings.warn(f"PhysicsPreprocess: tiny 1D input shape={tuple(x.shape)}; using zeros fallback.")
+                return self._fallback_image(x.device, x.dtype)
+            raise ValueError(f"Tiny 1D tensor cannot represent image: shape={tuple(x.shape)}")
+
+        if x.ndim == 1:
+            n = x.numel()
+            if n % self.in_chans == 0:
+                hw = n // self.in_chans
+                h = int(math.isqrt(hw))
+                if h * h == hw:
+                    return x.view(self.in_chans, h, h)
+            h = int(math.isqrt(n))
+            if h * h == n:
+                return x.view(1, h, h)
+            if self.allow_fallback_zeros:
+                warnings.warn(f"PhysicsPreprocess: cannot infer image shape from flattened length={n}; fallback zeros.")
+                return self._fallback_image(x.device, x.dtype)
+ 
+---OUTPUTS---
+Train samples: 8000 | Val samples: 2000
+Label distribution (full):  Counter({0: 5122, 1: 4878})
+Label distribution (train): Counter({0: 4107, 1: 3893})
+Label distribution (val):   Counter({0: 1015, 1: 985})
+Log-mass normalization: log_mean=4.8930, log_std=0.3718
+pT normalization: mean=520.6005, std=105.7265
+USE_PT_FEATURE=True
+Train batches: 250 | Val batches: 63
+
+--- Unlabeled samples (log-compressed, ch 0) ---
+
+--- Labeled validation samples (log-compressed, ch 0) ---
+
+====
+
+CELL 7 TYPE:markdown
+## Section 4: Model Architectures
+
+Four core architectures for benchmarking:
+- **StandardViT**: quadratic self-attention baseline O(N^2*d)
+- **LinearAttentionViT**: ReLU kernel linear attention O(N*d^2)
+- **L2ViT**: Linear Global Attention + Local Window Attention (hybrid)
+- **XCiTViT**: Cross-Covariance Attention O(N*d^2) (El-Nouby et al.)
+
+Modular design allows swapping attention mechanisms easily.
+====
+
+CELL 8 TYPE:code
+# ============================================================
+# Section 4: Model Architectures
+# StandardViT, LinearAttentionViT, L2ViT, XCiTViT
+# ============================================================
+
+import math
+from functools import partial
+
+import torch.nn.functional as F
+
+
+# ----------------------------------------------------------
+# Shared building blocks
+# ----------------------------------------------------------
+
+class DropPath(nn.Module):
+    """Stochastic Depth (Drop Path) regularization.
+    Reference: Huang et al., 2016."""
+
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor = torch.floor(random_tensor + keep_prob)
+        return x * random_tensor / keep_prob
+
+
+class PatchEmbed(nn.Module):
+    """Image-to-patch embedding using Conv2D.
+    Input: B x C x H x W -> Output: B x N x D
+    Includes positional encoding via learnable embeddings."""
+
+    def __init__(self, img_size=64, patch_size=8, in_chans=8, embed_dim=256):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.n_patches = (img_size // patch_size) ** 2
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj(x)                          # (B, D, H/P, W/P)
+        x = x.flatten(2).transpose(1, 2)          # (B, N, D)
+        return x
+
+
+class MLP(nn.Module):
+    """Two-layer FFN with GELU activation and dropout."""
+
+    def __init__(self, in_features: int, hidden_features: int = None, dropout: float = 0.0):
+        super().__init__()
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_features, in_features)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+def _make_cls_head(in_dim: int, out_dim: int, dropout: float = 0.1) -> nn.Sequential:
+    """Two-layer classification head."""
+    return nn.Sequential(
+        nn.Linear(in_dim, in_dim // 2),
+        nn.GELU(),
+        nn.Dropout(dropout),
+        nn.Linear(in_dim // 2, out_dim),
+    )
+
+
+def _make_reg_head(in_dim: int, dropout: float = 0.1) -> nn.Sequential:
+    """Deeper 3-layer regression head for improved mass prediction."""
+    return nn.Sequential(
+        nn.Linear(in_dim, in_dim // 2),
+        nn.GELU(),
+        nn.Dropout(dropout),
+        nn.Linear(in_d
+---OUTPUTS---
+============================================================
+Model Architecture Summary
+============================================================
+
+StandardViT:
+  mass_pred shape : torch.Size([2, 1])
+  class_logits shape: torch.Size([2, 2])
+  Trainable params: 8,244,355 (8.24M)
+
+LinearAttentionViT:
+  mass_pred shape : torch.Size([2, 1])
+  class_logits shape: torch.Size([2, 2])
+  Trainable params: 8,244,355 (8.24M)
+
+L2ViT:
+  mass_pred shape : torch.Size([2, 1])
+  class_logits shape: torch.Size([2, 2])
+  Trainable params: 8,403,080 (8.40M)
+
+XCiTViT:
+  mass_pred shape : torch.Size([2, 1])
+  class_logits shape: torch.Size([2, 2])
+  Trainable params: 8,313,555 (8.31M)
+============================================================
+
+====
+
+CELL 9 TYPE:markdown
+## Section 5: Self-Supervised Pretraining Models
+
+Three masked-image-modeling approaches for representation learning:
+- **MAEPretrainer**: Masked Autoencoder with pixel reconstruction
+- **MAEv2Pretrainer**: Feature distillation with EMA teacher
+- **SimMIMPretrainer**: Simple MIM with L1 pixel loss
+====
+
+CELL 10 TYPE:code
+# ============================================================
+# Section 5: Self-Supervised Pretraining Models (Requirement-Aligned)
+# Modular Linear-Attention encoder + SimMIM / MAE / MAEv2
+# ============================================================
+
+import copy
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ----------------------------------------------------------
+# Core modular blocks
+# ----------------------------------------------------------
+
+class PatchEmbedding(nn.Module):
+    def __init__(self, img_size=IMG_SIZE, patch_size=PATCH_SIZE, in_chans=IN_CHANS, embed_dim=EMBED_DIM):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.in_chans = in_chans
+        self.embed_dim = embed_dim
+        self.n_side = img_size // patch_size
+        self.n_patches = self.n_side * self.n_side
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj(x)
+        x = x.flatten(2).transpose(1, 2)
+        return x
+
+
+class LinearSelfAttention(nn.Module):
+    def __init__(self, dim: int, num_heads: int = 8, dropout: float = 0.0, eps: float = 1e-6):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.eps = eps
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, D = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+
+        q = F.elu(q) + 1.0
+        k = F.elu(k) + 1.0
+
+        kv = k.transpose(-2, -1) @ v
+        out_num = q @ kv
+
+        k_sum = k.sum(dim=-2, keepdim=True)
+        out_den = (q * k_sum).sum(dim=-1, keepdim=True).clamp(min=self.eps)
+        out = out_num / out_den
+        out = torch.nan_to_num(out, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        out = out.transpose(1, 2).reshape(B, N, D)
+        out = self.proj(out)
+        return self.proj_drop(out)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.0, drop_path: float = 0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = UnifiedLinearAttention(dim, num_heads=num_heads, dropout=dropout)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = MLP(dim, int(dim * mlp_ratio), dropout)
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+
+
+class EnergyProxyHead(nn.Module):
+    """
+    Mass-aware SSL auxili
+---OUTPUTS---
+Self-supervised pretraining models defined (Linear-Attention modular):
+  MAEPretrainer, MAEv2Pretrainer, SimMIMPretrainer
+  MAE: loss=0.6671, params=9,864,068
+  SimMIM: loss=0.5762, params=8,203,396
+  MAEv2: loss=0.8806, params=11,442,052
+
+====
+
+CELL 11 TYPE:markdown
+> **Requirement mode note:** Section 9 uses `SimMIMLinearPretrainer` built on the modular **Linear Attention** encoder defined in Section 5. Dataset loading, training loops, and evaluation logic are intentionally unchanged for reproducible comparison against scratch training.
+====
+
+CELL 12 TYPE:markdown
+## Section 6: Training Utilities
+====
+
+CELL 13 TYPE:code
+import gc
+import math
+import pandas as pd
+
+# ============================================================
+# Section 6: Training Utilities
+# Mixed-precision training, evaluation, early stopping,
+# cosine LR scheduling with warmup, and model checkpointing
+# ============================================================
+#
+# --- v2 changes ---
+# • compute_loss: uses LAMBDA_REG (default 0.2), optional Huber loss
+# • train_epoch: optional AMP (USE_AMP), batch-level logging, flush=True
+# • evaluate_model: unchanged logic, added class_probs for ROC-AUC etc.
+# • EarlyStopping: can monitor macro-F1 (higher is better)
+# • EMAModel: optional exponential moving average
+# • run_experiment / run_experiment_uw: checkpoint by val macro-F1,
+#   tie-break with lower MAE; two-phase training option; progress logs
+# ============================================================
+
+import copy
+from tqdm.auto import tqdm
+
+# AMP imports (version-safe)
+try:
+    from torch.amp import GradScaler, autocast
+except ImportError:
+    from torch.cuda.amp import GradScaler, autocast
+
+
+# ----------------------------------------------------------
+# Loss function
+# ----------------------------------------------------------
+
+def compute_loss(mass_pred, mass_true, class_logits, class_true,
+                 regression_weight=None, class_weights=None):
+    """Combined CE + lambda * {MSE or Huber} loss with mass normalisation."""
+    if regression_weight is None:
+        regression_weight = LAMBDA_REG
+
+    mass_true_norm = (mass_true - MASS_MEAN) / (MASS_STD + 1e-8)
+
+    if USE_HUBER_LOSS:
+        reg_loss = F.smooth_l1_loss(mass_pred.squeeze(1), mass_true_norm)
+    else:
+        reg_loss = F.mse_loss(mass_pred.squeeze(1), mass_true_norm)
+
+    if class_weights is not None:
+        ce = F.cross_entropy(class_logits, class_true, weight=class_weights.to(class_logits.device))
+    else:
+        ce = F.cross_entropy(class_logits, class_true)
+
+    total = ce + regression_weight * reg_loss
+    return total, reg_loss, ce
+
+
+# ----------------------------------------------------------
+# Cosine schedule with linear warmup
+# ----------------------------------------------------------
+
+class CosineWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
+    """Cosine annealing with linear warmup."""
+
+    def __init__(self, optimizer, warmup_epochs, total_epochs, eta_min=1e-6, last_epoch=-1):
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.eta_min = eta_min
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup_epochs:
+            alpha = self.last_epoch / max(1, self.warmup_epochs)
+            return [base_lr * alpha for base_lr in self.base_lrs]
+        else:
+            progress = (self.last_epoch - self.warmup_epochs) / max(1, self.total_epochs - self.warmup_epochs)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return [self.eta_min + (base_lr - self.eta_min) * cosine for ba
+---OUTPUTS---
+Training utilities defined (v2):
+  - compute_loss (CE + lambda*{MSE|Huber} with mass normalization)
+  - CosineWarmupScheduler (cosine annealing with linear warmup)
+  - EMAModel (optional exponential moving average)
+  - train_epoch (optional AMP + gradient clipping + batch logging)
+  - evaluate_model (no_grad evaluation with mass denormalization + class_probs)
+  - measure_inference_speed (ms per sample)
+  - EarlyStopping (patience-based, supports max/min mode)
+  - UncertaintyWeightedLoss (Kendall et al.)
+  - compute_class_weights (inverse-frequency weighting)
+  - run_experiment (standard CE+MSE/Huber, checkpoint by F1)
+  - run_experiment_uw (uncertainty-weighted, checkpoint by F1)
+
+====
+
+CELL 14 TYPE:code
+# ============================================================
+# Section 6.1: Regression-first compatibility patch
+# - Section 3 returns normalized masses from dataset
+# - Avoid double normalization
+# - Checkpoint + early stop by MAE (tie-break: higher F1)
+# ============================================================
+
+RAW_MASS_MEAN = MASS_MEAN
+RAW_MASS_STD = MASS_STD
+
+# Give regression sufficient weight in the joint objective
+LAMBDA_REG = 1.0
+
+
+def compute_loss(mass_pred, mass_true, class_logits, class_true,
+                 regression_weight=None, class_weights=None):
+    """Combined CE + lambda * {MSE or Huber} with normalized mass targets."""
+    if regression_weight is None:
+        regression_weight = LAMBDA_REG
+
+    # Masses from dataset are already normalized in Section 3
+    mass_true_norm = mass_true
+
+    if USE_HUBER_LOSS:
+        reg_loss = F.smooth_l1_loss(mass_pred.squeeze(1), mass_true_norm)
+    else:
+        reg_loss = F.mse_loss(mass_pred.squeeze(1), mass_true_norm)
+
+    if class_weights is not None:
+        ce = F.cross_entropy(class_logits, class_true, weight=class_weights.to(class_logits.device))
+    else:
+        ce = F.cross_entropy(class_logits, class_true)
+
+    total = ce + regression_weight * reg_loss
+    return total, reg_loss, ce
+
+
+@torch.no_grad()
+def evaluate_model(model, loader):
+    """Evaluate model; denormalize both prediction and target masses for metric computation."""
+    model.eval()
+    all_mass_pred, all_mass_true = [], []
+    all_class_pred, all_class_true, all_class_probs = [], [], []
+    total_loss = total_mse = total_ce = 0.0
+    n_batches = len(loader)
+
+    for batch in tqdm(loader, desc="  eval ", leave=False):
+        imgs, masses, labels = batch[0], batch[1], batch[2]
+        pt = batch[3].to(DEVICE) if len(batch) >= 4 else None
+        imgs   = imgs.to(DEVICE)
+        masses = masses.to(DEVICE)
+        labels = labels.to(DEVICE)
+
+        mass_pred, class_logits = model(imgs, pt)
+        loss, mse, ce = compute_loss(mass_pred, masses, class_logits, labels)
+
+        total_loss += loss.item()
+        total_mse += mse.item()
+        total_ce += ce.item()
+
+        # Denormalize: undo z-score, then undo log if LOG_MASS=True
+        mass_pred_norm = mass_pred.squeeze(1) * (RAW_MASS_STD + 1e-8) + RAW_MASS_MEAN
+        mass_true_norm = masses               * (RAW_MASS_STD + 1e-8) + RAW_MASS_MEAN
+        if LOG_MASS:
+            mass_pred_denorm = torch.exp(mass_pred_norm)
+            mass_true_denorm = torch.exp(mass_true_norm)
+        else:
+            mass_pred_denorm = mass_pred_norm
+            mass_true_denorm = mass_true_norm
+
+        all_mass_pred.append(mass_pred_denorm.cpu())
+        all_mass_true.append(mass_true_denorm.cpu())
+        all_class_pred.append(class_logits.argmax(dim=1).cpu())
+        all_class_true.append(labels.cpu())
+        all_class_probs.append(torch.softmax(class_logits, dim=1).cpu())
+
+    return {
+        "mass_pred": torch.cat(all_mass_pred).numpy(),
+        "mass_true": torch
+---OUTPUTS---
+Section 6.1 patch active:
+  - LAMBDA_REG forced to 1.0
+  - compute_loss uses normalized targets from dataset
+  - evaluate_model denormalizes both pred and true masses
+  - run_experiment checkpoint/early-stop by MAE (tie-break F1)
+  - run_experiment_uw checkpoint/early-stop by MAE (tie-break F1)
+
+====
+
+CELL 15 TYPE:markdown
+## Section 7: Evaluation Metrics
+====
+
+CELL 16 TYPE:code
+# ============================================================
+# Section 6: Evaluation Metrics
+# Full suite of classification + regression metrics
+# ============================================================
+#
+# --- v2 changes ---
+# • Added balanced_accuracy, roc_auc, pr_auc, ece
+# • NaN/Inf safety for all metrics
+# ============================================================
+
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    confusion_matrix,
+    mean_squared_error,
+    mean_absolute_error,
+    r2_score,
+    roc_auc_score,
+    average_precision_score,
+)
+
+
+def _safe_finite(arr):
+    """Replace NaN/Inf with 0 for safe metric computation."""
+    arr = np.asarray(arr, dtype=np.float64)
+    arr = np.where(np.isfinite(arr), arr, 0.0)
+    return arr
+
+
+def compute_ece(probs, labels, n_bins=10):
+    """Expected Calibration Error."""
+    probs = _safe_finite(probs)
+    confidences = np.max(probs, axis=1)
+    predictions = np.argmax(probs, axis=1)
+    accuracies = (predictions == labels).astype(float)
+
+    bin_boundaries = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        mask = (confidences > bin_boundaries[i]) & (confidences <= bin_boundaries[i + 1])
+        if mask.sum() > 0:
+            bin_acc = accuracies[mask].mean()
+            bin_conf = confidences[mask].mean()
+            ece += mask.sum() * abs(bin_acc - bin_conf)
+    return ece / len(labels) if len(labels) > 0 else 0.0
+
+
+def compute_metrics(eval_results: dict) -> dict:
+    """
+    Compute comprehensive classification and regression metrics.
+
+    Parameters
+    ----------
+    eval_results : dict
+        Output of evaluate_model(). Must have keys:
+        mass_pred, mass_true, class_pred, class_true.
+        Optionally: class_probs (for ROC-AUC, PR-AUC, ECE).
+
+    Returns
+    -------
+    dict with keys:
+        accuracy, balanced_accuracy, f1, precision, recall, confusion_matrix,
+        roc_auc, pr_auc, ece  (classification)
+        mse, mae, r2          (regression)
+    """
+    y_true = eval_results["class_true"]
+    y_pred = eval_results["class_pred"]
+    m_true = _safe_finite(eval_results["mass_true"])
+    m_pred = _safe_finite(eval_results["mass_pred"])
+
+    metrics = {
+        # Classification
+        "accuracy": accuracy_score(y_true, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "f1": f1_score(y_true, y_pred, average="macro", zero_division=0),
+        "precision": precision_score(y_true, y_pred, average="macro", zero_division=0),
+        "recall": recall_score(y_true, y_pred, average="macro", zero_division=0),
+        "confusion_matrix": confusion_matrix(y_true, y_pred),
+        # Regression
+        "mse": mean_squared_error(m_true, m_pred),
+        "mae": mean_absolute_error(m_true, m_pred),
+        "r2": r2_score(m_true, m_pred) if len(set(m_true)) > 1 else 0.0,
+    }
+
+    # ROC-AUC, PR-AUC, ECE (require class probabilities)
+    
+---OUTPUTS---
+Metrics functions defined: compute_metrics(), print_metrics(), compute_ece()
+
+====
+
+CELL 17 TYPE:markdown
+## Section 8: Visualization Tools
+====
+
+CELL 18 TYPE:code
+# ============================================================
+# Section 7: Visualization Tools
+# Plotting functions for training curves, metrics, and images
+# ============================================================
+
+import seaborn as sns
+import pandas as pd
+
+plt.rcParams.update({
+    "figure.dpi": 100,
+    "axes.titlesize": 12,
+    "axes.labelsize": 10,
+    "font.size": 10,
+})
+
+
+def plot_training_curves(history: dict, title: str = "Training Curves") -> None:
+    """
+    Plot loss and accuracy vs epoch for a single model.
+
+    Parameters
+    ----------
+    history : dict
+        Keys: train_loss, val_loss, val_acc (lists, one value per epoch).
+    title : str
+        Figure title.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    epochs = range(1, len(history["train_loss"]) + 1)
+
+    axes[0].plot(epochs, history["train_loss"], label="Train Loss", linewidth=2)
+    axes[0].plot(epochs, history["val_loss"], label="Val Loss", linewidth=2, linestyle="--")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[0].set_title(f"{title} — Loss")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(epochs, history["val_acc"], label="Val Accuracy", linewidth=2, color="green")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Accuracy")
+    axes[1].set_title(f"{title} — Validation Accuracy")
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_mass_scatter(
+    true_mass: np.ndarray,
+    pred_mass: np.ndarray,
+    title: str = "Mass Prediction",
+) -> None:
+    """
+    Scatter plot of true vs predicted particle mass with R² annotation.
+
+    Parameters
+    ----------
+    true_mass : array (N,)
+    pred_mass : array (N,)
+    title : str
+    """
+    r2 = r2_score(true_mass, pred_mass)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.scatter(true_mass, pred_mass, alpha=0.3, s=10, edgecolors="none")
+    lims = [min(true_mass.min(), pred_mass.min()), max(true_mass.max(), pred_mass.max())]
+    ax.plot(lims, lims, "r--", linewidth=1.5, label="Perfect prediction")
+    ax.set_xlabel("True Mass")
+    ax.set_ylabel("Predicted Mass")
+    ax.set_title(f"{title}\n$R^2 = {r2:.4f}$")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_confusion_matrix(
+    cm: np.ndarray,
+    class_names: list = None,
+    title: str = "Confusion Matrix",
+) -> None:
+    """
+    Heatmap of the confusion matrix using seaborn.
+
+    Parameters
+    ----------
+    cm : array (n_classes, n_classes)
+    class_names : list of str
+    title : str
+    """
+    if class_names is None:
+        class_names = [str(i) for i in range(len(cm))]
+    fig, ax = plt.subplots(figsize=(5, 4))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=class_names,
+        yticklabels=class_names,
+        ax=ax,
+    )
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title(title)
+    plt.tight_layout(
+---OUTPUTS---
+Visualization functions defined:
+  - plot_training_curves()
+  - plot_mass_scatter()
+  - plot_confusion_matrix()
+  - plot_sample_images()
+  - plot_comparison_curves()
+  - visualize_attention_maps()
+
+====
+
+CELL 19 TYPE:markdown
+## Section 9: Self-Supervised Pretraining
+
+> Requirement alignment: pretrain a **Linear Attention ViT encoder** on **unlabeled** data before supervised fine-tuning.
+
+Use **SimMIM, MAE, and MAEv2** (separate runs/checkpoints) with Linear Attention transformer blocks, then fine-tune each pretrained encoder on labeled data for direct comparison.
+====
+
+CELL 20 TYPE:code
+# ============================================================
+# Section 9: Self-Supervised Pretraining (Multi-SSL, FIXED)
+# - HDF5 only (no synthetic fallback)
+# - AMP compatible
+# - Runs SimMIM / MAE / MAEv2 on LinearAttention encoder
+# - Saves encoder weights separately for all 3 methods
+# ============================================================
+
+import gc
+import time
+from pathlib import Path
+from contextlib import nullcontext
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
+
+# --- AMP compatibility (old/new PyTorch) ---
+try:
+    from torch.amp import autocast as amp_autocast  # newer API
+except Exception:
+    amp_autocast = None
+
+try:
+    from torch.cuda.amp import GradScaler
+except Exception:
+    GradScaler = None
+
+
+def get_autocast_context(device: torch.device, enabled: bool):
+    if not enabled or device.type != "cuda":
+        return nullcontext()
+
+    if amp_autocast is not None:
+        try:
+            return amp_autocast(device_type="cuda", enabled=True)
+        except TypeError:
+            return amp_autocast(enabled=True)
+
+    from torch.cuda.amp import autocast as cuda_autocast
+    return cuda_autocast(enabled=True)
+
+
+print("=" * 70)
+print("Self-Supervised Pretraining (LinearAttention Encoder): SimMIM + MAE + MAEv2")
+print("=" * 70)
+
+# ----------------------------------------------------------
+# Build unlabeled loader (HDF5 required)
+# ----------------------------------------------------------
+if not UNLABELED_FILE.exists():
+    raise FileNotFoundError(f"Unlabeled HDF5 file not found: {UNLABELED_FILE}")
+
+# Use explicit key to avoid key-inference surprises
+pretrain_dataset_raw = LazyHDF5Dataset(
+    UNLABELED_FILE,
+    labeled=False,
+    img_key="jet",
+)
+
+pretrain_dataset = TransformedDataset(pretrain_dataset_raw, ValTransform(IMG_SIZE, IN_CHANS))
+pretrain_loader = DataLoader(
+    pretrain_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=0,
+    pin_memory=(DEVICE.type == "cuda"),
+    drop_last=True,
+)
+
+print(f"Pretraining samples: {len(pretrain_dataset)} | batches: {len(pretrain_loader)}")
+
+# --- Force full pretraining schedule requested ---
+PRETRAIN_EPOCHS = 30
+print(f"Using PRETRAIN_EPOCHS={PRETRAIN_EPOCHS} for each SSL model", flush=True)
+
+# --- Safety assertion: ensure full-run epochs ---
+assert PRETRAIN_EPOCHS >= 10, (
+    f"PRETRAIN_EPOCHS={PRETRAIN_EPOCHS} is too low; likely debug mode. "
+    f"Set RUN_MODE='full' and PRETRAIN_EPOCHS>=10."
+)
+
+SSL_PRETRAIN_CONFIGS = {
+    "SimMIM": {
+        "cls": SimMIMPretrainer,
+        "kwargs": {"mask_ratio": 0.50},
+        "ckpt": "linear_vit_pretrain_simmim_vit-5_chnges.pt",
+        "plot_label": "SimMIM Loss",
+    },
+    "MAE": {
+        "cls": MAEPretrainer,
+        "kwargs": {"mask_ratio": 0.75},
+        "ckpt": "linear_vit_pretrain_mae_vit-5_chnges.pt",
+        "plot_label": "MAE Loss",
+    },
+    "MAEv2": {
+        "cls": MAEv2Pretrainer,
+        "kwargs": {"mask_ratio": 0.85
+---OUTPUTS---
+======================================================================
+Self-Supervised Pretraining (LinearAttention Encoder): SimMIM + MAE + MAEv2
+======================================================================
+[LazyHDF5Dataset] file=C:\Users\Rahul\Desktop\AA Gsoc'26\data\Dataset_Specific_Unlabelled.h5
+  img_key=jet
+Pretraining samples: 60000 | batches: 1875
+Using PRETRAIN_EPOCHS=30 for each SSL model
+
+----------------------------------------------------------------------
+[FULL RUN] Pretraining SimMIM for 30 epochs
+----------------------------------------------------------------------
+SimMIM parameters: 8,203,396 (8.20M)
+                                                                                                                         Epoch   5/30 | loss=0.3297
+                                                                                                                         Epoch  10/30 | loss=0.3182
+                                                                                                                         Epoch  15/30 | loss=0.3116
+                                                                                                                         Epoch  20/30 | loss=0.3041
+                                                                                                                         Epoch  25/30 | loss=0.2989
+                                                                                                                         Epoch  30/30 | loss=0.2972
+SimMIM pretraining complete in 10678.6s
+Saved SimMIM encoder -> C:\Users\Rahul\Desktop\AA Gsoc'26\checkpoints\linear_vit_pretrain_simmim_vit-5_chnges.pt
+
+----------------------------------------------------------------------
+[FULL RUN] Pretraining MAE for 30 epochs
+----------------------------------------------------------------------
+MAE parameters: 9,864,068 (9.86M)
+                                                                                                         
+====
+
+CELL 21 TYPE:markdown
+## Section 10: Fine-tune Pretrained Linear Attention ViT Variants
+
+> Requirement alignment: fine-tune **SimMIM-pretrained, MAE-pretrained, and MAEv2-pretrained** Linear Attention ViT models with low learning rate and compare against scratch and other baselines.
+====
+
+CELL 22 TYPE:code
+# ============================================================
+# Section 10: Fine-tune Pretrained Linear Attention ViT Variants
+# (fixed autocast + visible epoch status + optional tqdm bar)
+# ============================================================
+
+from pathlib import Path
+from contextlib import nullcontext
+import copy
+import gc
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from tqdm.auto import tqdm
+
+# ---------------------------
+# Logging controls
+# ---------------------------
+PRINT_EPOCH_START = True
+PRINT_EPOCH_END = True
+EPOCH_STATUS_EVERY = 1      # set 5 if you want every 5 epochs
+SHOW_TQDM_BAR = True        # True = live per-epoch progress bar
+LOG_EVERY_N_BATCHES = 0     # no per-50-batch logs
+
+def log(msg):
+    print(msg, flush=True)
+
+# ---------------------------
+# AMP compatibility helper
+# ---------------------------
+try:
+    from torch.amp import autocast as amp_autocast
+except Exception:
+    amp_autocast = None
+
+try:
+    from torch.cuda.amp import autocast as cuda_autocast
+except Exception:
+    cuda_autocast = None
+
+def get_autocast_context(device, enabled=True):
+    if (not enabled) or (device.type != "cuda"):
+        return nullcontext()
+
+    if amp_autocast is not None:
+        try:
+            return amp_autocast(device_type="cuda", enabled=True)
+        except TypeError:
+            try:
+                return amp_autocast(enabled=True)
+            except Exception:
+                pass
+
+    if cuda_autocast is not None:
+        return cuda_autocast(enabled=True)
+
+    return nullcontext()
+
+def autocast(*args, **kwargs):
+    enabled = bool(kwargs.get("enabled", True))
+    return get_autocast_context(DEVICE, enabled=enabled)
+
+# ---------------------------
+# Inference speed (pT-safe)
+# ---------------------------
+@torch.no_grad()
+def measure_inference_speed(model, input_shape=(1, IN_CHANS, IMG_SIZE, IMG_SIZE), n_runs=50):
+    """Average inference time per sample in milliseconds."""
+    model.eval()
+    dummy = torch.randn(*input_shape, device=DEVICE)
+    dummy_pt = torch.zeros(input_shape[0], device=DEVICE, dtype=dummy.dtype)
+
+    def _forward_once(x):
+        # pT-aware models (new) and legacy models (old) both supported
+        try:
+            return model(x, dummy_pt)
+        except TypeError:
+            return model(x)
+
+    for _ in range(5):
+        _ = _forward_once(dummy)
+
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+
+    start = time.time()
+    for _ in range(n_runs):
+        _ = _forward_once(dummy)
+
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+
+    elapsed = (time.time() - start) / n_runs * 1000
+    return elapsed
+
+
+# ---------------------------
+# One-run UW fine-tune
+# ---------------------------
+def run_experiment_uw_quiet(
+    model_class,
+    model_name,
+    train_loader,
+    val_loader,
+    pretrained_state=None,
+    epochs=None,
+    lr=None,
+    weight_decay=None,
+    patience=None,
+    seed=None,
+):
+    if epochs is None
+---OUTPUTS---
+Loading pretrained encoder checkpoints:
+  SimMIM: C:\Users\Rahul\Desktop\AA Gsoc'26\checkpoints\linear_vit_pretrain_simmim_vit-5_chnges.pt
+  MAE: C:\Users\Rahul\Desktop\AA Gsoc'26\checkpoints\linear_vit_pretrain_mae_vit-5_chnges.pt
+  MAEv2: C:\Users\Rahul\Desktop\AA Gsoc'26\checkpoints\linear_vit_pretrain_maev2_vit-5_chnges.pt
+
+======================================================================
+[FULL RUN] Fine-tuning Linear Attention ViT (SimMIM-pretrained)
+======================================================================
+
+============================================================
+Experiment (UW-Loss): Linear Attention ViT (SimMIM-pretrained)
+lr=3.000e-05, wd=0.0001, epochs=35
+============================================================
+Loading pretrained encoder weights...
+Loaded 110/110 block params.
+Parameters: 8,244,355 (8.24M)
+  [Phase A] Encoder frozen for epochs 1–7
+[Epoch 1/35] start | lr=0.000e+00
+[Epoch 1/35] end | train_loss=1.0624 | val_loss=1.1477 | val_f1=0.3351 | val_acc=0.5040 | val_mae=43.8268 | lr=0.000e+00 | finite_steps=250/250 | nonfinite_steps=0
+[Epoch 2/35] start | lr=1.000e-05
+[Epoch 2/35] end | train_loss=1.0598 | val_loss=1.1427 | val_f1=0.3385 | val_acc=0.5075 | val_mae=43.7375 | lr=1.000e-05 | finite_steps=250/250 | nonfinite_steps=0
+[Epoch 3/35] start | lr=2.000e-05
+[Epoch 3/35] end | train_loss=1.0095 | val_loss=0.9721 | val_f1=0.4503 | val_acc=0.5510 | val_mae=33.8425 | lr=2.000e-05 | finite_steps=250/250 | nonfinite_steps=0
+[Epoch 4/35] start | lr=3.000e-05
+[Epoch 4/35] end | train_loss=0.8753 | val_loss=0.8804 | val_f1=0.6355 | val_acc=0.6535 | val_mae=28.8613 | lr=3.000e-05 | finite_steps=250/250 | nonfinite_steps=0
+[Epoch 5/35] start | lr=2.993e-05
+[Epoch 5/35] end | train_loss=0.8266 | val_loss=0.8255 | val_f1=0.7189 | val_acc=0.7195 | val_mae=26.9340 | lr=2.993e-05 | finite_steps=250/250 | nonfinite_steps=0
+[Epoch 6/35] start | lr=2.972e-05
+[Epoch 6/35] end | train_loss=0.7811 | val_loss=0.7820 | val_f1=0.7265 | val_acc
+====
+
+CELL 23 TYPE:markdown
+## Section 11: Train Linear Attention ViT from Scratch
+
+> Requirement alignment: scratch baseline for direct comparison against pretrained linear attention model.
+====
+
+CELL 24 TYPE:code
+# ============================================================
+# Section 11: Train Linear Attention ViT from Scratch
+# ============================================================
+
+# --- Safety assertion: ensure full-run epochs ---
+assert EPOCHS >= 10, (
+    f"EPOCHS={EPOCHS} is too low; likely debug mode. "
+    f"Set RUN_MODE='full' and EPOCHS>=10."
+)
+print(f"[FULL RUN] Training Linear Attention ViT (scratch) for {EPOCHS} epochs", flush=True)
+
+result_linear_scratch = run_experiment_uw(
+    model_class=LinearAttentionViT,
+    model_name="Linear Attention ViT (scratch)_vit-5_chnges",
+    train_loader=train_loader,
+    val_loader=val_loader,
+    pretrained_state=None,
+    epochs=EPOCHS,
+    lr=LR,
+    weight_decay=WEIGHT_DECAY,
+)
+print("\nLinear Attention ViT (scratch) training complete.")
+plot_training_curves(result_linear_scratch["history"], title="Linear Attention ViT (scratch) -- Training Curves")
+plot_mass_scatter(
+    result_linear_scratch["final_results"]["mass_true"],
+    result_linear_scratch["final_results"]["mass_pred"],
+    title="Linear Attention ViT (scratch) -- Mass Prediction",
+)
+plot_confusion_matrix(
+    result_linear_scratch["final_metrics"]["confusion_matrix"],
+    class_names=[str(i) for i in range(NUM_CLASSES)],
+    title="Linear Attention ViT (scratch) -- Confusion Matrix",
+)
+---OUTPUTS---
+[FULL RUN] Training Linear Attention ViT (scratch) for 35 epochs
+
+============================================================
+  Experiment (UW-Loss): Linear Attention ViT (scratch)_vit-5_chnges
+  lr=0.0003, wd=0.0001, epochs=35
+  Selection metric: val MAE (tie-break: val F1)
+============================================================
+  Parameters: 8,244,355 (8.24M)
+  [Phase A] Encoder frozen for epochs 1–7
+  [Epoch 1/35] start | lr=0.00e+00
+  [Epoch 1/35] end   | train_loss=1.0625 | val_loss=1.1481 | val_mae=43.8277 | val_f1=0.3367 | val_acc=0.5075
+  [Epoch 2/35] start | lr=1.00e-04
+  [Epoch 2/35] end   | train_loss=1.0370 | val_loss=0.9975 | val_mae=34.0794 | val_f1=0.4331 | val_acc=0.5360
+  [Epoch 3/35] start | lr=2.00e-04
+  [Epoch 3/35] end   | train_loss=0.9439 | val_loss=0.9600 | val_mae=32.6468 | val_f1=0.5795 | val_acc=0.5935
+  [Epoch 4/35] start | lr=3.00e-04
+  [Epoch 4/35] end   | train_loss=0.9050 | val_loss=0.9707 | val_mae=33.2121 | val_f1=0.5223 | val_acc=0.5745
+  [Epoch 5/35] start | lr=2.99e-04
+  [Epoch 5/35] end   | train_loss=0.8801 | val_loss=0.9609 | val_mae=32.7413 | val_f1=0.5772 | val_acc=0.6020
+  [Epoch 6/35] start | lr=2.97e-04
+  [Epoch 6/35] end   | train_loss=0.8469 | val_loss=0.9363 | val_mae=31.7343 | val_f1=0.5382 | val_acc=0.5785
+  [Epoch 7/35] start | lr=2.94e-04
+  [Epoch 7/35] end   | train_loss=0.8260 | val_loss=1.0124 | val_mae=34.8981 | val_f1=0.4351 | val_acc=0.5355
+  [Phase B] Encoder unfrozen — full fine-tuning begins
+  [Epoch 8/35] start | lr=2.89e-04
+  [Epoch 8/35] end   | train_loss=0.9068 | val_loss=0.6961 | val_mae=27.2594 | val_f1=0.7813 | val_acc=0.7855
+  [Epoch 9/35] start | lr=2.82e-04
+  [Epoch 9/35] end   | train_loss=0.5780 | val_loss=0.5985 | val_mae=22.1917 | val_f1=0.8035 | val_acc=0.8050
+  [Epoch 10/35] start | lr=2.75e-04
+  [Epoch 10/35] end   | train_loss=0.4865 | val_loss=0.6320 | val_mae=25.5172 | val_f1=0.7892 | val_acc=0.7900
+  [Epoch 11/35] start | lr=2.66e-04
+  [Epoch 11/35] end   | train_loss=0.4284 | v
+====
+
+CELL 25 TYPE:markdown
+## Section 12 (Optional Baseline): Train Standard ViT
+====
+
+CELL 26 TYPE:code
+# ============================================================
+# Section 12: Train Standard ViT
+# ============================================================
+
+# --- Safety assertion: ensure full-run epochs ---
+assert EPOCHS >= 10, (
+    f"EPOCHS={EPOCHS} is too low; likely debug mode. "
+    f"Set RUN_MODE='full' and EPOCHS>=10."
+)
+print(f"[FULL RUN] Training Standard ViT for {EPOCHS} epochs", flush=True)
+
+result_vit = run_experiment_uw(
+    model_class=StandardViT,
+    model_name="Standard ViT",
+    train_loader=train_loader,
+    val_loader=val_loader,
+    epochs=EPOCHS,
+    lr=LR,
+    weight_decay=WEIGHT_DECAY,
+)
+print("\nStandard ViT training complete.")
+plot_training_curves(result_vit["history"], title="Standard ViT -- Training Curves")
+plot_mass_scatter(
+    result_vit["final_results"]["mass_true"],
+    result_vit["final_results"]["mass_pred"],
+    title="Standard ViT -- Mass Prediction",
+)
+plot_confusion_matrix(
+    result_vit["final_metrics"]["confusion_matrix"],
+    class_names=[str(i) for i in range(NUM_CLASSES)],
+    title="Standard ViT -- Confusion Matrix",
+)
+
+---OUTPUTS---
+[FULL RUN] Training Standard ViT for 35 epochs
+
+============================================================
+  Experiment (UW-Loss): Standard ViT
+  lr=0.0003, wd=0.0001, epochs=35
+  Selection metric: val MAE (tie-break: val F1)
+============================================================
+  Parameters: 8,244,355 (8.24M)
+  [Phase A] Encoder frozen for epochs 1–7
+  [Epoch 1/35] start | lr=0.00e+00
+  [Epoch 1/35] end   | train_loss=1.0614 | val_loss=1.1482 | val_mae=43.8276 | val_f1=0.3367 | val_acc=0.5075
+  [Epoch 2/35] start | lr=1.00e-04
+  [Epoch 2/35] end   | train_loss=1.0416 | val_loss=0.9943 | val_mae=34.5644 | val_f1=0.5032 | val_acc=0.5580
+  [Epoch 3/35] start | lr=2.00e-04
+  [Epoch 3/35] end   | train_loss=0.9425 | val_loss=0.9511 | val_mae=32.4551 | val_f1=0.5715 | val_acc=0.5890
+  [Epoch 4/35] start | lr=3.00e-04
+  [Epoch 4/35] end   | train_loss=0.8965 | val_loss=0.9660 | val_mae=33.1117 | val_f1=0.4942 | val_acc=0.5625
+  [Epoch 5/35] start | lr=2.99e-04
+  [Epoch 6/35] end   | train_loss=0.8457 | val_loss=0.9293 | val_mae=31.4410 | val_f1=0.5912 | val_acc=0.6135
+  [Epoch 7/35] start | lr=2.94e-04
+  [Epoch 7/35] end   | train_loss=0.8325 | val_loss=1.0186 | val_mae=34.6942 | val_f1=0.4200 | val_acc=0.5255
+  [Phase B] Encoder unfrozen — full fine-tuning begins
+  [Epoch 8/35] start | lr=2.89e-04
+  [Epoch 8/35] end   | train_loss=0.9452 | val_loss=0.9492 | val_mae=29.9286 | val_f1=0.3300 | val_acc=0.4925
+  [Epoch 9/35] start | lr=2.82e-04
+  [Epoch 9/35] end   | train_loss=0.6313 | val_loss=0.6890 | val_mae=25.7628 | val_f1=0.7752 | val_acc=0.7810
+  [Epoch 10/35] start | lr=2.75e-04
+  [Epoch 10/35] end   | train_loss=0.4882 | val_loss=0.5733 | val_mae=22.2359 | val_f1=0.8070 | val_acc=0.8070
+  [Epoch 11/35] start | lr=2.66e-04
+  [Epoch 11/35] end   | train_loss=0.4248 | val_loss=0.5170 | val_mae=20.5534 | val_f1=0.8369 | val_acc=0.8370
+  [Epoch 12/35] start | lr=2.56e-04
+  [Epoch 12/35] end   | train_loss=0.3777 | val_loss=0.5643 | val_mae=21.5710 | val_f1=0.810
+====
+
+CELL 27 TYPE:markdown
+## Section 13 (Optional Baseline): Train XCiT ViT from Scratch
+====
+
+CELL 28 TYPE:code
+# ============================================================
+# Section 13: Train XCiT ViT from Scratch (Optional Baseline)
+# ============================================================
+
+# --- Safety assertion: ensure full-run epochs ---
+assert EPOCHS >= 10, (
+    f"EPOCHS={EPOCHS} is too low; likely debug mode. "
+    f"Set RUN_MODE='full' and EPOCHS>=10."
+)
+print(f"[FULL RUN] Training XCiT ViT (scratch baseline) for {EPOCHS} epochs", flush=True)
+
+result_xcit_scratch = run_experiment_uw(
+    model_class=XCiTViT,
+    model_name="XCiT ViT (scratch)",
+    train_loader=train_loader,
+    val_loader=val_loader,
+    epochs=EPOCHS,
+    lr=LR,
+    weight_decay=WEIGHT_DECAY,
+)
+print("\nXCiT ViT (scratch) training complete.")
+plot_training_curves(result_xcit_scratch["history"], title="XCiT ViT (scratch) -- Training Curves")
+plot_mass_scatter(
+    result_xcit_scratch["final_results"]["mass_true"],
+    result_xcit_scratch["final_results"]["mass_pred"],
+    title="XCiT ViT (scratch) -- Mass Prediction",
+)
+plot_confusion_matrix(
+    result_xcit_scratch["final_metrics"]["confusion_matrix"],
+    class_names=[str(i) for i in range(NUM_CLASSES)],
+    title="XCiT ViT (scratch) -- Confusion Matrix",
+)
+---OUTPUTS---
+[FULL RUN] Training XCiT ViT (scratch baseline) for 35 epochs
+
+============================================================
+  Experiment (UW-Loss): XCiT ViT (scratch)
+  lr=0.0003, wd=0.0001, epochs=35
+  Selection metric: val MAE (tie-break: val F1)
+============================================================
+  Parameters: 8,313,555 (8.31M)
+  [Phase A] Encoder frozen for epochs 1–7
+  [Epoch 1/35] start | lr=0.00e+00
+  [Epoch 1/35] end   | train_loss=1.0583 | val_loss=1.1477 | val_mae=43.8292 | val_f1=0.3300 | val_acc=0.4925
+  [Epoch 2/35] start | lr=1.00e-04
+  [Epoch 2/35] end   | train_loss=1.0518 | val_loss=1.1196 | val_mae=42.0593 | val_f1=0.3367 | val_acc=0.5075
+  [Epoch 3/35] start | lr=2.00e-04
+  [Epoch 3/35] end   | train_loss=0.9557 | val_loss=0.9834 | val_mae=33.4014 | val_f1=0.3367 | val_acc=0.5075
+  [Epoch 4/35] start | lr=3.00e-04
+  [Epoch 4/35] end   | train_loss=0.8979 | val_loss=0.9848 | val_mae=33.7201 | val_f1=0.3367 | val_acc=0.5075
+  [Epoch 5/35] start | lr=2.99e-04
+  [Epoch 5/35] end   | train_loss=0.8620 | val_loss=0.9794 | val_mae=33.5915 | val_f1=0.3367 | val_acc=0.5075
+  [Epoch 6/35] start | lr=2.97e-04
+  [Epoch 6/35] end   | train_loss=0.8267 | val_loss=0.9890 | val_mae=34.3156 | val_f1=0.3367 | val_acc=0.5075
+  [Epoch 7/35] start | lr=2.94e-04
+  [Epoch 7/35] end   | train_loss=0.8245 | val_loss=0.9832 | val_mae=32.7164 | val_f1=0.3367 | val_acc=0.5075
+  [Phase B] Encoder unfrozen — full fine-tuning begins
+  [Epoch 8/35] start | lr=2.89e-04
+  [Epoch 8/35] end   | train_loss=0.7181 | val_loss=0.6634 | val_mae=24.3523 | val_f1=0.7559 | val_acc=0.7630
+  [Epoch 9/35] start | lr=2.82e-04
+  [Epoch 9/35] end   | train_loss=0.5061 | val_loss=0.8349 | val_mae=33.4688 | val_f1=0.7100 | val_acc=0.7230
+  [Epoch 10/35] start | lr=2.75e-04
+  [Epoch 10/35] end   | train_loss=0.3849 | val_loss=0.5913 | val_mae=22.1962 | val_f1=0.7958 | val_acc=0.7995
+  [Epoch 11/35] start | lr=2.66e-04
+  [Epoch 11/35] end   | train_loss=0.3042 | val_loss=0.5210 | val_mae=19.
+====
+
+CELL 29 TYPE:markdown
+## Section 14: Train L2ViT
+====
+
+CELL 30 TYPE:code
+# ============================================================
+# Section 14: Train L2ViT
+# ============================================================
+
+# --- Safety assertion: ensure full-run epochs ---
+assert EPOCHS >= 10, (
+    f"EPOCHS={EPOCHS} is too low; likely debug mode. "
+    f"Set RUN_MODE='full' and EPOCHS>=10."
+)
+print(f"[FULL RUN] Training L2ViT for {EPOCHS} epochs", flush=True)
+
+result_l2vit = run_experiment_uw(
+    model_class=L2ViT,
+    model_name="L2ViT",
+    train_loader=train_loader,
+    val_loader=val_loader,
+    epochs=EPOCHS,
+    lr=LR,
+    weight_decay=WEIGHT_DECAY,
+)
+print("\nL2ViT training complete.")
+plot_training_curves(result_l2vit["history"], title="L2ViT -- Training Curves")
+plot_mass_scatter(
+    result_l2vit["final_results"]["mass_true"],
+    result_l2vit["final_results"]["mass_pred"],
+    title="L2ViT -- Mass Prediction",
+)
+plot_confusion_matrix(
+    result_l2vit["final_metrics"]["confusion_matrix"],
+    class_names=[str(i) for i in range(NUM_CLASSES)],
+    title="L2ViT -- Confusion Matrix",
+)
+---OUTPUTS---
+[FULL RUN] Training L2ViT for 35 epochs
+
+============================================================
+  Experiment (UW-Loss): L2ViT
+  lr=0.0003, wd=0.0001, epochs=35
+  Selection metric: val MAE (tie-break: val F1)
+============================================================
+  Parameters: 8,403,080 (8.40M)
+  [Phase A] Encoder frozen for epochs 1–7
+  [Epoch 1/35] start | lr=0.00e+00
+  [Epoch 2/35] end   | train_loss=1.0514 | val_loss=1.1250 | val_mae=42.6590 | val_f1=0.3554 | val_acc=0.5140
+  [Epoch 3/35] start | lr=2.00e-04
+  [Epoch 3/35] end   | train_loss=1.0035 | val_loss=1.0523 | val_mae=38.9413 | val_f1=0.4292 | val_acc=0.5365
+  [Epoch 4/35] start | lr=3.00e-04
+  [Epoch 4/35] end   | train_loss=0.9547 | val_loss=1.0609 | val_mae=37.9260 | val_f1=0.5137 | val_acc=0.5665
+  [Epoch 5/35] start | lr=2.99e-04
+  [Epoch 5/35] end   | train_loss=0.9343 | val_loss=1.0078 | val_mae=36.3355 | val_f1=0.6231 | val_acc=0.6250
+  [Epoch 6/35] start | lr=2.97e-04
+  [Epoch 6/35] end   | train_loss=0.8933 | val_loss=1.0018 | val_mae=36.7034 | val_f1=0.6218 | val_acc=0.6225
+  [Epoch 7/35] start | lr=2.94e-04
+  [Epoch 7/35] end   | train_loss=0.9041 | val_loss=1.0108 | val_mae=36.5903 | val_f1=0.5127 | val_acc=0.5685
+  [Phase B] Encoder unfrozen — full fine-tuning begins
+  [Epoch 8/35] start | lr=2.89e-04
+  [Epoch 8/35] end   | train_loss=0.6220 | val_loss=0.4353 | val_mae=17.5847 | val_f1=0.8575 | val_acc=0.8575
+  [Epoch 9/35] start | lr=2.82e-04
+  [Epoch 9/35] end   | train_loss=0.3481 | val_loss=0.4006 | val_mae=15.1890 | val_f1=0.8665 | val_acc=0.8670
+  [Epoch 10/35] start | lr=2.75e-04
+  [Epoch 10/35] end   | train_loss=0.2321 | val_loss=0.4539 | val_mae=18.1657 | val_f1=0.8740 | val_acc=0.8745
+  [Epoch 11/35] start | lr=2.66e-04
+  [Epoch 11/35] end   | train_loss=0.1470 | val_loss=0.4234 | val_mae=19.6914 | val_f1=0.8785 | val_acc=0.8785
+  [Epoch 12/35] start | lr=2.56e-04
+  [Epoch 12/35] end   | train_loss=0.1011 | val_loss=0.3690 | val_mae=14.9027 | val_f1=0.8828 | val_acc=0.
+====
+
+CELL 31 TYPE:markdown
+## Section 15: Benchmark Comparison & Model Saving
+
+Comprehensive comparison across all trained model variants plus model weight saving.
+====
+
+CELL 32 TYPE:code
+# ============================================================
+# Section 15: Benchmark Comparison & Model Saving
+# ============================================================
+
+import os
+
+# Collect all results (required models first, optional baselines after)
+all_results = {
+    "Linear Attention ViT (SimMIM-pretrained)": result_linear_pretrained_all["SimMIM"],
+    "Linear Attention ViT (MAE-pretrained)": result_linear_pretrained_all["MAE"],
+    "Linear Attention ViT (MAEv2-pretrained)": result_linear_pretrained_all["MAEv2"],
+    "Linear Attention ViT (scratch)": result_linear_scratch,
+    "Standard ViT": result_vit,
+    "XCiT ViT (scratch)": result_xcit_scratch,
+    "L2ViT": result_l2vit,
+}
+
+rows = []
+for name, res in all_results.items():
+    m = res["final_metrics"]
+    rows.append({
+        "Model": name,
+        "Accuracy": f"{m['accuracy']:.4f}",
+        "Bal. Acc.": f"{m.get('balanced_accuracy', 0):.4f}",
+        "F1": f"{m['f1']:.4f}",
+        "ROC-AUC": f"{m.get('roc_auc', 0):.4f}",
+        "PR-AUC": f"{m.get('pr_auc', 0):.4f}",
+        "ECE": f"{m.get('ece', 0):.4f}",
+        "MSE": f"{m['mse']:.4f}",
+        "MAE": f"{m['mae']:.4f}",
+        "R2": f"{m['r2']:.4f}",
+        "Train Time (s)": f"{res['train_time']:.1f}",
+        "Inference (ms)": f"{res['inference_ms']:.2f}",
+        "GPU Mem (MB)": f"{res.get('peak_gpu_mem_mb', 0):.0f}",
+        "Parameters": f"{res['params']:,}",
+    })
+
+df = pd.DataFrame(rows).set_index("Model")
+print("\n" + "=" * 140, flush=True)
+print("BENCHMARK COMPARISON", flush=True)
+print("=" * 140, flush=True)
+print(df.to_string(), flush=True)
+print("=" * 140, flush=True)
+
+# ----------------------------------------------------------
+# Save results CSV
+# ----------------------------------------------------------
+results_dir = Path("../results")
+results_dir.mkdir(exist_ok=True)
+df.to_csv(results_dir / "final_benchmark_results.csv")
+print(f"Results saved to {results_dir / 'final_benchmark_results.csv'}", flush=True)
+
+# ----------------------------------------------------------
+# Save model weights
+# ----------------------------------------------------------
+
+models_dir = Path("../models")
+models_dir.mkdir(exist_ok=True)
+
+model_save_map = {
+    "Linear Attention ViT (SimMIM-pretrained)": "linear_vit_simmim_pretrained_vit-5_chnges.pt",
+    "Linear Attention ViT (MAE-pretrained)": "linear_vit_mae_pretrained_vit-5_chnges.pt",
+    "Linear Attention ViT (MAEv2-pretrained)": "linear_vit_maev2_pretrained_vit-5_chnges.pt",
+    "Linear Attention ViT (scratch)": "linear_vit_scratch_vit-5_chnges.pt",
+    "Standard ViT": "vit_vit-5_chnges.pt",
+    "XCiT ViT (scratch)": "xcit_scratch_vit-5_chnges.pt",
+    "L2ViT": "l2vit_vit-5_chnges.pt",
+}
+
+for name, filename in model_save_map.items():
+    if name in all_results and "model_state" in all_results[name]:
+        save_path = models_dir / filename
+        torch.save(all_results[name]["model_state"], save_path)
+        print(f"Saved {name} -> {save_path}", flush=True)
+
+# Save pretrain
+---OUTPUTS---
+
+============================================================================================================================================
+BENCHMARK COMPARISON
+============================================================================================================================================
+                                         Accuracy Bal. Acc.      F1 ROC-AUC  PR-AUC     ECE       MSE      MAE      R2 Train Time (s) Inference (ms) GPU Mem (MB) Parameters
+Model                                                                                                                                                                       
+Linear Attention ViT (SimMIM-pretrained)   0.8740    0.8742  0.8740  0.9396  0.9234  0.0337  538.0564  16.7014  0.8159         2189.1          18.73         1172  8,244,355
+Linear Attention ViT (MAE-pretrained)      0.8845    0.8849  0.8845  0.9502  0.9376  0.0321  429.7220  14.8667  0.8529         2184.1          16.80         1238  8,244,355
+Linear Attention ViT (MAEv2-pretrained)    0.8245    0.8248  0.8245  0.9069  0.8836  0.0311  736.2875  19.6364  0.7480         2183.5          16.28         1304  8,244,355
+Linear Attention ViT (scratch)             0.8340    0.8354  0.8328  0.9132  0.8827  0.0256  824.1970  17.8679  0.7180         2201.4          18.03         1370  8,244,355
+Standard ViT                               0.8615    0.8624  0.8612  0.9310  0.9116  0.0247  703.2146  16.2305  0.7594         2186.8          14.28         1400  8,244,355
+XCiT ViT (scratch)                         0.8410    0.8413  0.8410  0.9143  0.8889  0.0149  641.4811  17.6460  0.7805         1629.2          23.68         1630  8,313,555
+L2ViT                                      0.8695    0.8694  0.8694  0.9433  0.9303  0.0381  429.6759  12.0620  0.8530         2369.6          26.13         1561  8,403,080
+===========================================================================================================================================
+====
+
+CELL 33 TYPE:code
+# Requirement-aligned artifact naming: ensure linear pretrain checkpoint filenames
+from pathlib import Path
+import os
+import shutil
+
+models_dir = Path("../models")
+models_dir.mkdir(exist_ok=True)
+
+if "PRETRAINED_ENCODER_PATHS" in globals() and PRETRAINED_ENCODER_PATHS:
+    aligned_names = {
+        "SimMIM": "linear_vit_pretrain_simmim_vit-5_chnges.pt",
+        "MAE": "linear_vit_pretrain_mae_vit-5_chnges.pt",
+        "MAEv2": "linear_vit_pretrain_maev2_vit-5_chnges.pt",
+    }
+    for ssl_name, src_path in PRETRAINED_ENCODER_PATHS.items():
+        if os.path.exists(src_path):
+            aligned_encoder_path = models_dir / aligned_names.get(ssl_name, f"linear_vit_pretrain_{ssl_name.lower()}.pt")
+            shutil.copy2(src_path, aligned_encoder_path)
+            print(f"Saved requirement-aligned pretrained encoder ({ssl_name}) -> {aligned_encoder_path}", flush=True)
+
+# Backward-compatibility single-name artifact (SimMIM default)
+if "PRETRAINED_ENCODER_PATH" in globals() and os.path.exists(PRETRAINED_ENCODER_PATH):
+    legacy_path = models_dir / "linear_vit_pretrain.pt"
+    shutil.copy2(PRETRAINED_ENCODER_PATH, legacy_path)
+    print(f"Saved legacy pretrained encoder alias -> {legacy_path}", flush=True)
+---OUTPUTS---
+Saved requirement-aligned pretrained encoder (SimMIM) -> ..\models\linear_vit_pretrain_simmim_vit-5_chnges.pt
+Saved requirement-aligned pretrained encoder (MAE) -> ..\models\linear_vit_pretrain_mae_vit-5_chnges.pt
+Saved requirement-aligned pretrained encoder (MAEv2) -> ..\models\linear_vit_pretrain_maev2_vit-5_chnges.pt
+Saved legacy pretrained encoder alias -> ..\models\linear_vit_pretrain.pt
+
+====
+
+CELL 34 TYPE:markdown
+## Section 16: Final Results & Analysis
+====
+
+CELL 35 TYPE:code
+# ============================================================
+# Section 16: Final Results & Conclusions
+# ============================================================
+
+print("\n" + "=" * 140, flush=True)
+print("FINAL BENCHMARK RESULTS -- PARTICLE COLLISION IMAGE ANALYSIS", flush=True)
+print("=" * 140, flush=True)
+print(df.to_string(), flush=True)
+print("=" * 140, flush=True)
+
+# Best-per-metric analysis
+best_acc = max(all_results, key=lambda n: all_results[n]["final_metrics"]["accuracy"])
+best_r2 = max(all_results, key=lambda n: all_results[n]["final_metrics"]["r2"])
+best_f1 = max(all_results, key=lambda n: all_results[n]["final_metrics"]["f1"])
+fastest = min(all_results, key=lambda n: all_results[n]["train_time"])
+smallest = min(all_results, key=lambda n: all_results[n]["params"])
+best_mse = min(all_results, key=lambda n: all_results[n]["final_metrics"]["mse"])
+best_bal_acc = max(all_results, key=lambda n: all_results[n]["final_metrics"].get("balanced_accuracy", 0))
+
+print(f"\n  Best Classification Accuracy : {best_acc}", flush=True)
+print(f"  Best Balanced Accuracy       : {best_bal_acc}", flush=True)
+print(f"  Best F1 Score                : {best_f1}", flush=True)
+print(f"  Best Regression R2           : {best_r2}", flush=True)
+print(f"  Lowest MSE                   : {best_mse}", flush=True)
+print(f"  Fastest Training             : {fastest}", flush=True)
+print(f"  Smallest Model               : {smallest}", flush=True)
+
+# Requirement-focused pretraining benefit analysis (Linear Attention ViT)
+ssl_variants = ["SimMIM", "MAE", "MAEv2"]
+scratch_acc = result_linear_scratch["final_metrics"]["accuracy"]
+scratch_r2 = result_linear_scratch["final_metrics"]["r2"]
+
+print("\n  Pretraining benefit vs scratch (Linear ViT):", flush=True)
+for ssl_name in ssl_variants:
+    k = f"Linear Attention ViT ({ssl_name}-pretrained)"
+    pt_acc = all_results[k]["final_metrics"]["accuracy"]
+    pt_r2 = all_results[k]["final_metrics"]["r2"]
+    print(f"    {ssl_name:6s} | ΔAcc={pt_acc - scratch_acc:+.4f} | ΔR2={pt_r2 - scratch_r2:+.4f}", flush=True)
+
+best_ssl = max(
+    ssl_variants,
+    key=lambda n: all_results[f"Linear Attention ViT ({n}-pretrained)"]["final_metrics"]["f1"],
+)
+print(f"\n  Best SSL pretraining method by F1: {best_ssl}", flush=True)
+
+# Backward-compatibility variables (SimMIM default)
+result_linear_pretrained = result_linear_pretrained_all["SimMIM"]
+
+# Demonstrate loading saved model weights
+print("\n--- Model Weight Loading Demo ---", flush=True)
+models_dir = Path("../models")
+for name, filename in model_save_map.items():
+    fpath = models_dir / filename
+    if fpath.exists():
+        try:
+            state = torch.load(fpath, map_location="cpu", weights_only=True)
+        except TypeError:
+            state = torch.load(fpath, map_location="cpu")
+        print(f"  Loaded {filename}: {len(state)} parameter tensors", flush=True)
+
+print("\n" + "=" * 140, flush=True)
+print("Summary Complete -- See full comparison table above.", flush=True)
+print("=" * 
+---OUTPUTS---
+
+============================================================================================================================================
+FINAL BENCHMARK RESULTS -- PARTICLE COLLISION IMAGE ANALYSIS
+============================================================================================================================================
+                                         Accuracy Bal. Acc.      F1 ROC-AUC  PR-AUC     ECE       MSE      MAE      R2 Train Time (s) Inference (ms) GPU Mem (MB) Parameters
+Model                                                                                                                                                                       
+Linear Attention ViT (SimMIM-pretrained)   0.8740    0.8742  0.8740  0.9396  0.9234  0.0337  538.0564  16.7014  0.8159         2189.1          18.73         1172  8,244,355
+Linear Attention ViT (MAE-pretrained)      0.8845    0.8849  0.8845  0.9502  0.9376  0.0321  429.7220  14.8667  0.8529         2184.1          16.80         1238  8,244,355
+Linear Attention ViT (MAEv2-pretrained)    0.8245    0.8248  0.8245  0.9069  0.8836  0.0311  736.2875  19.6364  0.7480         2183.5          16.28         1304  8,244,355
+Linear Attention ViT (scratch)             0.8340    0.8354  0.8328  0.9132  0.8827  0.0256  824.1970  17.8679  0.7180         2201.4          18.03         1370  8,244,355
+Standard ViT                               0.8615    0.8624  0.8612  0.9310  0.9116  0.0247  703.2146  16.2305  0.7594         2186.8          14.28         1400  8,244,355
+XCiT ViT (scratch)                         0.8410    0.8413  0.8410  0.9143  0.8889  0.0149  641.4811  17.6460  0.7805         1629.2          23.68         1630  8,313,555
+L2ViT                                      0.8695    0.8694  0.8694  0.9433  0.9303  0.0381  429.6759  12.0620  0.8530         2369.6          26.13         1561  8,403,080
+===================================================================================================
+====
+
+CELL 36 TYPE:markdown
+## Analysis & Discussion
+
+### Attention Mechanism Comparison
+
+| Architecture | Attention | Complexity | Key Feature |
+|---|---|---|---|
+| Standard ViT | Softmax(QK^T/sqrt(d))V | O(N^2*d) | Baseline |
+| Linear Attention ViT | phi(Q)(phi(K)^T V) | O(N*d^2) | ReLU kernel maps |
+| L2ViT | LWA + LGA | O(N*d^2) + O(w^2*d) | Hybrid local+global |
+| XCiT ViT | Q^T K (channel) | O(N*d^2) | Cross-covariance |
+
+### Physics-Informed Design Choices
+
+- **Preprocessing**: Log energy compression, noise suppression, energy centroid alignment, event normalization, and per-channel standardization
+- **Augmentation**: Detector-safe transforms only (horizontal flip, Gaussian noise, energy scaling, patch masking)
+- **Mass Handling**: Dataset returns normalized mass targets; training/evaluation patch prevents double normalization and reports denormalized regression metrics
+- **Deeper Regression Head**: 3-layer MLP captures complex mass-feature relationships
+
+### Self-Supervised Pretraining (Requirement-Aligned)
+
+Self-supervised pretraining is applied on a **LinearAttention encoder** using **SimMIM, MAE, and MAEv2** on unlabeled detector data.
+The pretrained-vs-scratch gap for **Linear Attention ViT** quantifies the benefit of unlabeled pretraining under the task requirement.
+
+### Multi-Task Learning
+
+Uncertainty-weighted loss (Kendall et al., 2018) automatically balances classification and regression.
+====
+
+CELL 37 TYPE:code
+# ============================================================
+# Remove duplicate saved weight files (.pt) automatically
+# Add this as the LAST cell and run once
+# ============================================================
+
+from pathlib import Path
+import hashlib
+
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+root = Path.cwd().resolve()
+target_dirs = [(root / "../models").resolve(), (root / "../checkpoints").resolve()]
+target_dirs = [d for d in target_dirs if d.exists()]
+
+if not target_dirs:
+    print("No target folders found: ../models or ../checkpoints")
+else:
+    # Prefer keeping these canonical files if duplicates exist
+    preferred_keep = {
+        (root / "../models/linear_vit_simmim_pretrained_vit-5_chnges.pt").resolve(),
+        (root / "../models/linear_vit_mae_pretrained_vit-5_chnges.pt").resolve(),
+        (root / "../models/linear_vit_maev2_pretrained_vit-5_chnges.pt").resolve(),
+        (root / "../models/linear_vit_scratch_vit-5_chnges.pt").resolve(),
+        (root / "../models/vit_vit-5_chnges.pt").resolve(),
+        (root / "../models/xcit_scratch_vit-5_chnges.pt").resolve(),
+        (root / "../models/l2vit_vit-5_chnges.pt").resolve(),
+        (root / "../checkpoints/linear_vit_pretrain_simmim_vit-5_chnges.pt").resolve(),
+        (root / "../checkpoints/linear_vit_pretrain_mae_vit-5_chnges.pt").resolve(),
+        (root / "../checkpoints/linear_vit_pretrain_maev2_vit-5_chnges.pt").resolve(),
+    }
+
+    # Collect all .pt files
+    pt_files = []
+    for d in target_dirs:
+        pt_files.extend(sorted(p.resolve() for p in d.glob("*.pt")))
+
+    if not pt_files:
+        print("No .pt files found.")
+    else:
+        # Group by content hash
+        by_hash = {}
+        for p in pt_files:
+            try:
+                digest = sha256_file(p)
+                by_hash.setdefault(digest, []).append(p)
+            except Exception as e:
+                print(f"[WARN] Could not hash {p}: {e}")
+
+        to_delete = []
+        kept = []
+
+        for _, files in by_hash.items():
+            if len(files) == 1:
+                kept.append(files[0])
+                continue
+
+            keeper = next((f for f in files if f in preferred_keep), None)
+            if keeper is None:
+                keeper = sorted(files, key=lambda x: (len(str(x)), str(x)))[0]
+
+            kept.append(keeper)
+            to_delete.extend([f for f in files if f != keeper])
+
+        deleted = 0
+        for p in to_delete:
+            try:
+                p.unlink()
+                deleted += 1
+            except Exception as e:
+                print(f"[WARN] Failed to delete {p}: {e}")
+
+        print("\n=== Duplicate Weight Cleanup Done ===")
+        print(f"Folders scanned: {[str(d) for d in target_dirs]}")
+        print(f"Total 
+---OUTPUTS---
+
+=== Duplicate Weight Cleanup Done ===
+Folders scanned: ["C:\\Users\\Rahul\\Desktop\\AA Gsoc'26\\models", "C:\\Users\\Rahul\\Desktop\\AA Gsoc'26\\checkpoints"]
+Total .pt files scanned: 10
+Unique weight files kept: 10
+Duplicate files deleted: 0
+
+====
+
+CELL 38 TYPE:code
+
+====

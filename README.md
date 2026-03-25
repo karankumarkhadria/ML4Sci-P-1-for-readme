@@ -1,186 +1,263 @@
-# ⚡ Linear Attention Vision Transformer for Particle Physics
+# ⚡ Linear Attention Vision Transformer for Particle Collision Analysis
 
-> **GSoC project** — Efficient transformer-based **joint mass regression & quark/gluon jet classification** on LHC calorimeter images, developed through a rigorous 6-notebook evolution from prototype to production.
+## 1. 🌌 Title & Overview
 
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.3.0-red?logo=pytorch)](https://pytorch.org/)
-[![Python](https://img.shields.io/badge/Python-3.x-blue?logo=python)](https://python.org/)
-[![CUDA](https://img.shields.io/badge/CUDA-12.1-green?logo=nvidia)](https://developer.nvidia.com/cuda-toolkit)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
+### Project Title
+**Linear Attention ViT for Joint Jet Mass Regression and Quark/Gluon Classification**
 
----
+### Problem Statement
+This project builds an efficient Vision Transformer pipeline for high-energy physics detector images to solve two tasks together:
+- **Regression**: predict jet mass
+- **Classification**: identify quark vs gluon jets
 
-## 🏆 Key Highlights
+### Why This Project Matters
+In collider physics, models must process large, sparse detector images efficiently and accurately. Standard self-attention becomes expensive as token count increases. This work explores how **linear attention** can preserve transformer quality while improving scalability.
 
-- 🎯 **88.45% classification accuracy** (quark/gluon jet tagging, 2,000-sample val set)
-- 📈 **R² = 0.8529** for jet mass regression (up from ≈0 at baseline)
-- ⚡ **Linear Attention** — O(N²·d) → O(N·d²); ReLU kernel trick for efficient scaling
-- 🔀 **Multi-task learning** — joint regression + classification in a single forward pass
-- 🗃️ **70,000 jet images** (10K labeled + 60K unlabeled for self-supervised pre-training)
-- 🔬 3 SSL pre-training methods compared: **MAE, SimMIM, MAEv2**
+### Brief on Linear Attention ViT
+Instead of forming a full attention matrix, linear attention uses a kernelized formulation (ReLU feature map) to reduce attention complexity and memory pressure. This enables practical transformer training while still supporting rich global feature interactions.
 
 ---
 
-## 📊 At a Glance
+## 2. 🚀 Project Journey (IMPORTANT)
 
-| Metric | v1 Baseline | **v6 Final** |
-|--------|-------------|-------------|
-| Accuracy | 81.60% | **88.45%** |
-| F1 Score | 0.816 | **0.8845** |
-| ROC-AUC | — | **0.9502** |
-| R² (mass regression) | ≈ 0.00 | **0.8529** |
-| MAE (mass) | — | **14.87 GeV** |
+The repository notebooks document a clear research-to-engineering progression:
 
----
+### Timeline-style progression
 
-## 🌌 Overview
+- **v1 — `linear_attention_vit.ipynb` (prototype baseline)**
+  - Built first full end-to-end pipeline (pretrain + finetune + scratch comparison).
+  - Implemented XCiT-style linear attention encoder.
+  - Observed core issue: regression quality was effectively collapsed (**R² ~ 0**) while classification looked reasonable.
+  - Key lesson: pipeline worked mechanically, but target scaling/loss setup needed redesign.
 
-Modern LHC experiments produce millions of **jet images** — 8-channel calorimeter snapshots of particle collisions (shape: `125×125×8`). Two tasks must be solved simultaneously:
+- **v2 — `linear_attention_vit-2.ipynb` (multi-architecture benchmark)**
+  - Added Standard ViT, Linear Attention ViT, L2ViT, XCiT.
+  - Added SSL pretraining modules (SimMIM/MAE/MAEv2 scaffold) and richer experiment utilities.
+  - Showed strong classification for Linear Attention ViT (~0.874 acc), but instability/imbalance across architectures remained.
+  - Key lesson: framework matured, but training dynamics were still brittle for some models.
 
-1. **Regression** — predict the jet's invariant mass (continuous, GeV)
-2. **Classification** — distinguish quark jets from gluon jets (binary)
+- **v3 — `linear_attention_vit-3.ipynb` (evaluation + reproducibility expansion)**
+  - Added stronger evaluation suite: ROC-AUC, PR-AUC, ECE, balanced accuracy.
+  - Added multi-seed runs and mini hyperparameter sweeps.
+  - Exposed variance and confirmed model behavior under broader settings.
+  - Key lesson: deeper metrics showed where models were truly robust vs superficially good.
 
-Standard self-attention scales as **O(N²·d)** — prohibitive for large images. This project replaces it with **linear attention** (`φ(Q)(φ(K)ᵀV)`, φ=ReLU), reducing complexity to **O(N·d²)** while preserving expressivity. Self-supervised pre-training on 60K unlabeled jets enables powerful feature learning before fine-tuning on only 8K labeled samples.
+- **v4 — `linear_attention_vit-4.ipynb` (pipeline alignment + multi-SSL fine-tuning)**
+  - Shifted to requirement-aligned linear-attention-first pretraining/fine-tuning workflow.
+  - Introduced compatibility patches and cleaner training utilities.
+  - Multi-SSL comparison became clear (SimMIM/MAE/MAEv2 for linear attention).
+  - Key lesson: architecture and training code became stable enough for targeted optimization.
 
-> 📄 See [REPORT.md](REPORT.md) for full dataset details, architecture specs, and experiment logs.
+- **v5 (final available notebook) — `linear_attention_vit-5_chnges.ipynb` (major improvements & optimization)**
+  - Added improved preprocessing (energy centroid alignment, safer augmentation, log-mass handling).
+  - Applied stronger multitask balancing and checkpointing logic (Best-F1 and Best-MAE views).
+  - Achieved best overall Linear Attention ViT results (MAE-pretrained variant):
+    - **Accuracy: 0.8845**
+    - **R²: 0.8529**
+    - **MSE: 429.7220 (RMSE ≈ 20.73)**
+  - Major breakthrough: final setup significantly improved regression while maintaining high classification quality.
 
----
-
-## 🧠 Architecture
-
-```mermaid
-flowchart TD
-    A["🛰️ Raw Detector Image\n125×125×8 calorimeter channels"]
-    B["⚙️ Physics Preprocessing\nlog1p · noise suppression · centroid align\nresize → 64×64×8"]
-    C["🧩 Patch Embedding\n8×8 patches → 64 tokens + pT feature\n→ [B, 64, 256]"]
-    D["🔁 Linear Attention Transformer\n10 blocks · ReLU kernel φ(Q)(φ(K)ᵀV)\nO(N·d²) — no N×N matrix"]
-    E["🔽 Global Mean Pooling\n→ [B, 256]"]
-    F["📏 Regression Head\n→ log-mass → exp → GeV"]
-    G["🏷️ Classification Head\n→ Quark / Gluon logit"]
-
-    A --> B --> C --> D --> E --> F
-    E --> G
-```
-
-**Key details:**
-- `embed_dim=256`, `depth=10`, `heads=8`, `~8.24M params`
-- Loss: `CrossEntropy + λ·SmoothL1(log_mass)` with `λ=1.0`
-- Two-phase training: 7 epochs (encoder frozen) → 28 epochs (full fine-tune)
-
----
-
-## 🚀 Project Journey
-
-Six notebooks, each fixing a real bug or adding a key insight:
-
-| Version | Key Change | Best Result |
-|---------|-----------|------------|
-| **v1** — prototype | XCiT-style LinearViT (1.25M params), MAE pre-train | Acc=81.60%, R²≈0 |
-| **v2** — scale-up | 8M params, 3 architectures, SimMIM — but mass not normalized → **100% acc bug** | MSE=2922 🐛 |
-| **v3** — fix regression | Mass normalization fixed, L2ViT + XCiT added | Acc=87.40%, R²=0.65 ✓ |
-| **v4** — richer eval | ROC-AUC, ECE, HPO sweep; LAMBDA_REG=0.2 | Acc=87.20%, R²=0.61 |
-| **v5** — SSL comparison | All 3 SSL methods; fine-tune LR reduced 10×; centroid alignment | Acc=87.50%, R²=0.62 |
-| **v6 ⭐** — final | Log-mass norm, pT feature, LAMBDA=1.0, two-phase training | **Acc=88.45%, R²=0.8529** |
-
-> 📄 Full per-notebook analysis, debugging logs, and HPO results → [REPORT.md](REPORT.md)
+### Major breakthroughs
+1. Transition from baseline implementation to architecture benchmarking.
+2. Expansion from basic metrics to reliability metrics and seed-based validation.
+3. Shift to requirement-aligned, modular SSL + fine-tune workflow.
+4. Final-stage optimization that produced balanced high performance across both tasks.
 
 ---
 
-## 📈 Performance Improvement
+## 3. 🧠 Model Architecture
 
-| Metric | Before (v1/v5) | **After (v6)** | Δ |
-|--------|---------------|----------------|---|
-| Accuracy | 81.60% → 87.50% | **88.45%** | **+6.85 pp** |
-| R² | ≈ 0.00 → 0.619 | **0.8529** | **+0.853 🚀** |
-| MAE (GeV) | — → 22.05 | **14.87** | **−32.5%** |
-| XCiT / L2ViT accuracy | **50.75% (stuck)** | **84–87%** | Fixed by two-phase training |
+### Simple explanation
+The model converts detector images into patch tokens, processes them with linear-attention transformer blocks, aggregates global features, and predicts both mass and class in parallel.
 
-**Breakthrough changes in v6:**
-- 🔑 **Two-phase training** — fixed XCiT/L2ViT (stuck at 50.75% for 3 versions)
-- 📐 **Log-space mass normalization** — R² jumped from 0.62 → 0.85
-- ⚖️ **LAMBDA_REG 0.2 → 1.0** — equal task weighting; stopped classification from dominating
-- 🧬 **MAE pre-training** (+5.05% accuracy vs scratch, 75% mask ratio)
+### Components
+- **Input pipeline**
+  - HDF5 detector images
+  - physics-aware preprocessing (normalization, augmentation, centroid alignment)
+  - train/val split with class-distribution checks
+- **Linear Attention mechanism**
+  - Q/K/V projections + ReLU-kernelized linear attention
+  - avoids full quadratic token-token attention matrix
+- **Transformer blocks**
+  - stacked blocks with normalization + MLP + residual pathways
+- **Multi-task heads**
+  - **Regression head** for jet mass
+  - **Classification head** for quark/gluon prediction
 
----
+### ASCII architecture diagram
 
-## 🏁 Final Results (v6)
-
-| Model | Accuracy | F1 | ROC-AUC | R² | MAE (GeV) |
-|-------|----------|----|---------|-----|-----------|
-| **LinAttn (MAE) ⭐** | **0.8845** | **0.8845** | **0.9502** | **0.8529** | **14.87** |
-| LinAttn (SimMIM) | 0.8740 | 0.8740 | 0.9396 | 0.8159 | 16.70 |
-| L2ViT | 0.8695 | 0.8694 | 0.9433 | **0.8530** | **12.06** |
-| Standard ViT | 0.8615 | 0.8612 | 0.9310 | 0.7594 | 16.23 |
-| XCiT (scratch) | 0.8410 | 0.8410 | 0.9143 | 0.7805 | 17.65 |
-
-> 📄 Full benchmark with Bal.Acc, PR-AUC, ECE, MSE, training time, GPU memory → [REPORT.md](REPORT.md)
-
----
-
-## 🛠️ Tech Stack
-
-| Tool | Version | Usage |
-|------|---------|-------|
-| **Python** | 3.x | Core language |
-| **PyTorch** | 2.3.0+cu121 | Model training |
-| **h5py** | latest | HDF5 dataset I/O |
-| **NumPy / scikit-learn** | latest | Preprocessing, metrics |
-| **matplotlib** | latest | Visualizations |
-| **CUDA** | 12.1 | GPU acceleration (RTX 4050, 6.4 GB) |
-| **Jupyter Notebook** | latest | Interactive development |
-
----
-
-## 📌 How to Run
-
-```bash
-# 1. Install dependencies
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-pip install h5py numpy scikit-learn matplotlib tqdm jupyter
-
-# 2. Place datasets in data/
-#    data/Dataset_Specific_labelled_full_only_for_2i.h5   (10K labeled)
-#    data/Dataset_Specific_Unlabelled.h5                  (60K unlabeled)
-
-# 3. Open Jupyter and run the final notebook
-cd "jupyter notebook"
-jupyter notebook
-# → Open: linear_attention_vit-5_chnges - impr.ipynb
-```
-
-**Key config in the final notebook:**
-```python
-LAMBDA_REG        = 1.0    # equal regression/classification weight
-TWO_PHASE_TRAINING = True  # 7 frozen epochs → 28 full fine-tune epochs
-LR                = 3e-5   # for pre-trained encoder
-USE_PT_FEATURE    = True   # physics-informed pT feature
-```
-
-**Expected output (MAE-pretrained LinearViT):**
-```
-Accuracy = 88.45%  |  F1 = 0.8845  |  ROC-AUC = 0.9502
-MSE = 429.72       |  MAE = 14.87 GeV  |  R² = 0.8529
+```text
+Input Detector Image
+   │
+   ├─► Preprocessing (normalization, augmentations, centroid alignment)
+   │
+   ├─► Patch Embedding
+   │
+   ├─► Positional/Token Encoding
+   │
+   ├─► Linear Attention Transformer Blocks (stacked)
+   │       ├─ ReLU-kernelized attention
+   │       ├─ MLP feed-forward
+   │       └─ Residual + normalization
+   │
+   ├─► Feature Aggregation (pooling)
+   │
+   └─► Dual Heads
+           ├─ Regression Head  → Jet Mass
+           └─ Classification Head → Quark/Gluon
 ```
 
 ---
 
-## 🔮 Future Work
+## 4. 🌳 Repository Workflow (Tree Diagram)
 
-- [ ] **Ensemble** across 3+ seeds — expected to push accuracy to ~90%, R² > 0.88
-- [ ] **Pseudo-label** the 60K unlabeled jets to scale labeled set 7×
-- [ ] **Multi-scale patch embedding** (4×4 + 8×8 + 16×16) for richer jet representation
-- [ ] **Full 125×125 resolution** with sliding-window attention (no downsampling loss)
-- [ ] **Multi-class tagging** — top quark, W boson, Higgs, QCD background
-- [ ] **Mixed-precision training (AMP)** for faster iteration
+```text
+jupyter notebook/
+ ├── linear_attention_vit.ipynb
+ ├── linear_attention_vit-2.ipynb
+ ├── linear_attention_vit-3.ipynb
+ ├── linear_attention_vit-4.ipynb
+ └── linear_attention_vit-5_chnges.ipynb   (final available notebook)
+```
 
----
-
-## 🙏 Acknowledgements
-
-- **ML4Sci** for the particle physics dataset and problem formulation
-- [XCiT](https://arxiv.org/abs/2106.09681) (El-Nouby et al., 2021) · [MAE](https://arxiv.org/abs/2111.06377) (He et al., 2021) · [SimMIM](https://arxiv.org/abs/2111.09886) (Xie et al., 2021)
-- [Uncertainty-Weighted Loss](https://arxiv.org/abs/1705.07115) (Kendall & Gal, 2018)
+> Note: the repository’s final notebook filename is **`linear_attention_vit-5_chnges.ipynb`** (original repo naming).
 
 ---
 
-*Developed as part of the ML4Sci GSoC program. For full experimental details, see [REPORT.md](REPORT.md).*
+## 5. ⚙️ Key Features
 
+- ✅ Linear Attention ViT implementation with scalable attention computation
+- ✅ Efficient transformer experimentation across multiple architectures
+- ✅ Joint **regression + classification** multitask setup
+- ✅ Custom loss balancing (including MSE/Huber-style experimentation and weighted multitask terms)
+- ✅ SSL pretraining support (SimMIM, MAE, MAEv2) with downstream fine-tuning
+- ✅ Engineering-focused training utilities (schedulers, early stopping/checkpoints, reproducibility controls)
+
+---
+
+## 6. 📊 Experiments & Improvements
+
+### What changed and why
+- **From v1 to v2**: moved from single-model prototyping to architecture-level benchmarking.
+- **v2 to v3**: added deeper metrics and repeatability checks to avoid misleading conclusions.
+- **v3 to v4**: improved pipeline consistency and requirement alignment for linear-attention-first workflow.
+- **v4 to v5**: focused on data preprocessing quality, target handling, and multitask optimization to improve both tasks together.
+
+### Observed insights
+- **Loss behavior**: later notebooks show more stable and meaningful convergence patterns, especially for final MAE-pretrained linear attention runs.
+- **Stability**: multi-seed + broader metric tracking exposed brittle settings and guided robust choices.
+- **GPU utilization**: benchmark outputs consistently logged inference time, training time, and peak GPU memory, enabling practical model trade-off decisions.
+
+---
+
+## 7. 📈 Metrics Comparison Table
+
+| Version | Loss (MSE) | Accuracy | RMSE | Notes |
+|---|---:|---:|---:|---|
+| v1 (`linear_attention_vit.ipynb`) | ~0.0000 (normalized-scale artifact) | 0.8160 (scratch baseline) | N/A | Early pipeline; regression signal unreliable (R²≈0) |
+| v2 (`linear_attention_vit-2.ipynb`) | 1021.0089 | 0.8740 | 31.95 | Linear Attention benchmark became classification-strong |
+| v3 (`linear_attention_vit-3.ipynb`) | 1532.8457 | 0.8250 | 39.15 | Rich diagnostics revealed instability under expanded evaluation |
+| v4 (`linear_attention_vit-4.ipynb`) | 1112.3878 | 0.8750 | 33.35 | SimMIM-pretrained linear attention improved balance |
+| v5 final (`linear_attention_vit-5_chnges.ipynb`, MAE-pretrained) | **429.7220** | **0.8845** | **20.73** | Best overall balance; strongest final linear-attention result |
+
+---
+
+## 8. 📉 Charts & Visualizations (IMPORTANT)
+
+### 8.1 Loss vs Epoch (conceptual trend across versions)
+
+```text
+Loss
+│\
+│ \        v3 (higher/unstable)
+│  \__
+│     \__        v4 (more stable)
+│        \___
+│            \____ v5-final (lowest + smoothest)
+└────────────────────────────── Epoch
+```
+
+### 8.2 Accuracy vs Epoch (conceptual trend)
+
+```text
+Accuracy
+│                         ───── v5-final plateau (~0.88)
+│                  ───────
+│            ──────  v4 (~0.87)
+│      ──────
+│  ────  v2 (~0.87)   v3 lower/stable band (~0.82-0.83)
+└────────────────────────────── Epoch
+```
+
+### 8.3 Prediction vs Ground Truth (regression quality)
+
+```text
+Predicted Mass
+│                         .  .  . .
+│                    . . . . . .
+│                . . . . .
+│            . . .
+│        . .
+│    . .
+│ .
+└────────────────────────────── True Mass
+            (v5-final points lie closer to diagonal)
+```
+
+---
+
+## 9. 🔬 Final Model Insights
+
+- The final optimized stage works best because it combines:
+  1. stronger preprocessing,
+  2. mature SSL-to-finetune workflow,
+  3. multitask training balance,
+  4. tighter evaluation/checkpoint logic.
+- **Key optimization that worked**: MAE-pretrained Linear Attention ViT in final notebook gave the best combined classification-regression balance.
+- **Trade-offs**:
+  - Better accuracy/regression usually required longer training than the fastest baseline.
+  - Some alternative architectures could optimize one metric but underperform on multitask balance.
+
+---
+
+## 10. 🛠️ Tech Stack
+
+- **Python**
+- **PyTorch**
+- **NumPy**
+- **h5py**
+- **scikit-learn**
+- **matplotlib**
+- **Jupyter Notebook**
+- **CUDA GPU environment**
+
+---
+
+## 11. 🚀 Future Work
+
+- Add uncertainty-aware calibration for both heads in production inference.
+- Run larger seed ensembles for confidence intervals on final metrics.
+- Extend from binary quark/gluon tagging to richer particle taxonomy.
+- Explore hybrid local-global token mixing for faster convergence.
+- Evaluate higher-resolution inputs with memory-aware token strategies.
+
+---
+
+## 12. 📌 How to Run
+
+1. **Clone repository** and move into project root.
+2. **Install dependencies** used in notebooks (PyTorch, NumPy, h5py, scikit-learn, matplotlib, Jupyter).
+3. **Place datasets** in the expected data path referenced by notebook configuration cells.
+4. **Open notebooks in order** to understand evolution:
+   - `linear_attention_vit.ipynb`
+   - `linear_attention_vit-2.ipynb`
+   - `linear_attention_vit-3.ipynb`
+   - `linear_attention_vit-4.ipynb`
+   - `linear_attention_vit-5_chnges.ipynb` (final practical notebook in this repo)
+5. **Run all cells** in the final notebook to reproduce strongest final Linear Attention ViT metrics.
+6. Optionally run earlier notebooks for ablation and progression comparison.
+
+---
+
+### ✅ Project Summary
+This repository demonstrates a full engineering journey from prototype to optimized linear-attention transformer for physics data, with measurable improvements in both regression and classification, documented through iterative notebook-driven experimentation.

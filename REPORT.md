@@ -376,61 +376,8 @@ flowchart LR
     end
 ```
 
-### R² Improvement Across Notebooks
 
-```
-R²
-0.90 │                                                ● v6 L2ViT (0.8530)
-     │                                                ● v6 MAE-LinViT (0.8529)
-0.82 │                                            ● v6 SimMIM-LinViT (0.8159)
-     │
-0.78 │                                        ● v6 XCiT (0.7805)
-     │                                        ● v6 StdViT (0.7594)
-0.72 │                                    ● v6 Scratch (0.7180)
-     │
-0.65 │                        ● v3 LinViT (0.6506)
-     │                    ● v5 SimMIM (0.6193) ● v4 StdViT (0.6115)
-0.60 │                ● v3 StdViT (0.5948)
-     │
-0.00 │ ██████ v2 BUG (R²=-0.0000)
--0.1 │────────────────────────────────────────────────────────── Notebook
-       v1       v2       v3       v4       v5       v6
-     (≈0)    (BUG)    (fixed)  (refine)  (SSL)    (FINAL)
-```
 
-### Architecture Evolution by Accuracy
-
-| Architecture | v3 Acc | v4 Acc | v5 Acc | v6 Acc | Δ (v3→v6) |
-|---|---|---|---|---|---|
-| LinAttn (MAE) | — | — | 0.8720 | **0.8845** | +1.25 pp |
-| LinAttn (SimMIM) | — | — | 0.8750 | 0.8740 | −0.10 pp |
-| **L2ViT** | 0.5075 | 0.5075 | 0.5075 | 0.8695 | **+36.20 pp ⬆⬆** |
-| Standard ViT | 0.8595 | 0.8720 | 0.8530 | 0.8615 | +0.20 pp |
-| **XCiT** | 0.5075 | 0.5075 | 0.5075 | 0.8410 | **+33.35 pp ⬆⬆** |
-| LinAttn (scratch) | 0.8740 | 0.8250 | 0.8420 | 0.8340 | −4.00 pp |
-
-### Prediction vs. Ground Truth Mass (v6 MAE-Pretrained LinearViT)
-
-```
-Pred.
-Mass
-(GeV)
- 220 │                                         ·····●●●●●
-     │                                    ····●●●●●●
- 180 │                              ·····●●●●●●         R²=0.8529
-     │                        ····●●●●●●●             85.3% variance explained
- 140 │                   ·····●●●●●●
-     │              ····●●●●●●●●         MAE=14.87 GeV
- 100 │         ·····●●●●●●
-     │    ·····●●●●●
-  60 │·····●●
-     │────────────────────────────────────────────────── True Mass (GeV)
-       60   80  100  120  140  160  180  200  220
-      (● = dense cluster near y=x ideal diagonal)
-      (· = sparse scatter farther from diagonal)
-```
-
----
 
 ## 🔬 Final Model Insights
 

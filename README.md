@@ -1,126 +1,155 @@
-# Linear Attention ViT for Particle Collision Analysis
+# Linear Attention ViT — GSoC Proposal Implementation Journey
 
-This folder contains implementations for efficient Vision Transformer-based analysis of high-energy physics detector images, combining **linear attention** mechanisms with multitask learning for joint jet mass regression and quark/gluon classification.
+This README documents the notebook journey for the GSoC implementation using only content and results shown in the notebooks.
 
-## Task Overview
+## Notebook Order (Implementation Timeline)
+1. `linear_attention_vit.ipynb`
+2. `linear_attention_vit-2.ipynb`
+3. `linear_attention_vit-3.ipynb`
+4. `linear_attention_vit-4.ipynb`
+5. `linear_attention_vit-5_chnges.ipynb` *(final notebook in this repository for step 5)*
 
-### Task 1: Dataset Preparation and Preprocessing
-- **Data Loading**: Reading HDF5 detector images of quark/gluon jets
-- **Physics-Aware Preprocessing**: Energy centroid alignment, normalization, and safe augmentation strategies
+---
 
-### Task 2: Linear Attention ViT — Multitask Learning
-- Building and training a Linear Attention Vision Transformer for simultaneous:
-  - **Regression**: predicting jet mass
-  - **Classification**: identifying quark vs gluon jets
+## Project Scope Covered Across Notebooks
+From the notebook markdown and outputs, the end-to-end scope is:
+- Dataset loading from HDF5 jet-image data
+- Physics-aware preprocessing and augmentation
+- ViT-family model building for joint regression + classification
+- SSL pretraining (SimMIM, MAE, MAEv2)
+- Supervised fine-tuning with multitask objectives
+- Multi-architecture benchmarking and richer evaluation metrics
 
-### Task 3: SSL Pretraining and Fine-tuning
-- Using self-supervised learning methods (SimMIM, MAE, MAEv2) to pretrain the Linear Attention ViT before supervised fine-tuning on labeled data
+Tasks repeatedly targeted in the notebooks:
+- **Classification**: quark vs gluon prediction
+- **Regression**: jet mass prediction
 
-### Bonus Task
-- Multi-architecture benchmarking (Standard ViT, Linear Attention ViT, L2ViT, XCiT) and building a physics-informed model using the learned representations
+---
 
-## Implementation Details
+## Notebook-by-Notebook Journey
 
-### Dataset Preparation
-The input data consists of HDF5 detector images representing quark and gluon jets from particle collisions. Each image encodes particle energy deposits across detector cells. Preprocessing involved:
+### 1) `linear_attention_vit.ipynb` — Initial end-to-end prototype
+What is implemented in this notebook:
+- Full pipeline notebook titled *Linear Attention Vision Transformers for Particle Collision Data*
+- Includes paper summary context (XCiT and L2ViT), data loading, preprocessing, model, pretraining, finetuning, scratch baseline, and evaluation
+- Multitask setup with classification + mass regression
 
-- **Energy centroid alignment**: Shifting each jet image so the energy-weighted centroid is centered, ensuring spatial consistency across samples
-- **Normalization**: Scaling pixel (energy deposit) values to a fixed range to stabilize training
-- **Log-mass handling**: Applying a log transform to the raw jet mass targets to reduce skewness and improve regression convergence
-- **Train/val split**: Performed with class-distribution checks to ensure balanced training across quark/gluon labels
+What was observed in outputs:
+- Finetuned model reports `Final Val Acc: 81.05%`
+- Scratch model reports `Final Val Acc: 81.60%`
+- Validation MSE is shown as `0.0000` in this notebook’s logging outputs, and comparison block shows pretraining not helping classification in this run
 
-This structured preprocessing pipeline was progressively improved across notebook versions, with the most stable version in `linear_attention_vit-5_chnges.ipynb`.
+Notebook takeaway:
+- Pipeline works end-to-end, but regression behavior in this version is not yet reliable and later notebooks refine it.
 
-![Complete Pipeline Workflow](images/Complete%20Pipeline%20Workflow.png)
+---
 
-### Linear Attention ViT Architecture
-Several architectures were explored across notebook iterations:
+### 2) `linear_attention_vit-2.ipynb` — Multi-architecture benchmark framework
+What is added in this notebook:
+- Notebook reorganized as a benchmark framework with sections for configuration, preprocessing, architectures, SSL pretraining modules, training utilities, metrics, and visualization
+- Four core architectures benchmarked:
+  - Standard ViT
+  - Linear Attention ViT
+  - L2ViT
+  - XCiT ViT
+- SimMIM pretraining pipeline integrated for encoder pretraining/fine-tuning comparison
 
-1. **Standard ViT (baseline)**: Full quadratic self-attention — strong baseline but expensive at higher resolutions.
+Final benchmark outputs in this notebook:
+- **Linear Attention ViT**: Accuracy **0.8740**, F1 **0.8739**, MSE **1021.0089**, MAE **21.2226**, R² **0.6506**
+- **Standard ViT**: Accuracy **0.8595**, F1 **0.8590**
+- **L2ViT**: best regression R² in this notebook (**0.7236**), but poor classification in this run
+- Notebook summary marks **Linear Attention ViT** as best classification model for this version
 
-2. **Linear Attention ViT (primary model)**: Replaces full attention with a ReLU-kernelized formulation that avoids forming the full token-token attention matrix, reducing memory and computational cost while retaining global feature mixing.
+Notebook takeaway:
+- Classification became strong with Linear Attention ViT in this benchmark-style setup.
 
-3. **L2ViT**: A variant using L2-normalized attention scores for additional numerical stability.
+---
 
-4. **XCiT-style Encoder**: Cross-covariance image transformer approach — attention across feature dimensions rather than spatial tokens.
+### 3) `linear_attention_vit-3.ipynb` — Richer evaluation and stress-testing
+What is expanded in this notebook:
+- Adds richer classification reliability metrics beyond accuracy/F1:
+  - Balanced Accuracy
+  - ROC-AUC
+  - PR-AUC
+  - ECE (calibration)
+- Keeps multi-architecture benchmarking and multitask setup
 
-![Linear Attention ViT Architecture](images/Linear%20Attention%20ViT%20For%20end%20to%20end%20mass%20regression%20and%20classification.png)
+Final benchmark outputs in this notebook:
+- **Standard ViT** performs best classification in this version:
+  - Accuracy **0.8720**, F1 **0.8718**, ROC-AUC **0.9407**, PR-AUC **0.9269**
+- **Linear Attention ViT** drops in this run:
+  - Accuracy **0.8250**, F1 **0.8249**, MSE **1532.8457**
 
-The key trade-off observed: standard ViT provided strong classification signals but was memory-intensive; linear attention achieved competitive accuracy at significantly lower compute, making it practical for large physics datasets.
+Notebook takeaway:
+- This version exposes instability/variance across configurations and motivates stricter alignment in the next notebook.
 
-![Attention Mechanism Comparison](images/Attention%20Mechanism%20Comparison.png)
+---
 
-### Physics-Aware Design
-The model incorporates physics-motivated design choices beyond standard ViT:
+### 4) `linear_attention_vit-4.ipynb` — Requirement-aligned Linear-Attention pipeline
+What changes in this notebook:
+- Notebook is explicitly aligned to required flow:
+  1. Pretrain **Linear Attention encoder** on unlabeled data
+  2. Fine-tune pretrained variants for supervised multitask learning
+  3. Compare against scratch and other architectures
+- Runs all three SSL methods for Linear Attention encoder:
+  - SimMIM
+  - MAE
+  - MAEv2
 
-- **Centroid alignment** as a preprocessing step mirrors how physicists define jet coordinate frames
-- **Log-mass regression target** accounts for the approximately log-normal distribution of jet masses in QCD
-- **Class-balanced sampling** reflects that quark/gluon ratios vary by process and must be controlled during training
+Final outputs for main variants in this notebook:
+- **Linear Attention ViT (SimMIM-pretrained)**:
+  - Accuracy **0.8750**, F1 **0.8750**, MSE **1112.3878**, MAE **22.0543**, R² **0.6193**
+- **Linear Attention ViT (MAE-pretrained)**:
+  - Accuracy **0.8720**, F1 **0.8718**, MSE **1122.2405**
+- **Linear Attention ViT (MAEv2-pretrained)**:
+  - Accuracy **0.8475**, F1 **0.8473**, MSE **1240.1278**
 
-![Physics-Aware Design](images/Physics-Aware%20Design.png)
+Notebook takeaway:
+- Requirement-aligned SSL→fine-tuning flow is stable, and SimMIM-pretrained linear attention is best in this notebook’s classification metrics.
 
-### Two-Phase Training: SSL Pretraining + Fine-tuning
-I implemented a two-phase training strategy to improve the model's generalization:
+---
 
-1. **SSL Pretraining Phase**: The Linear Attention ViT encoder is pretrained in a self-supervised manner using one of three strategies:
-   - **SimMIM**: Predicts masked image patches in pixel space
-   - **MAE (Masked Autoencoder)**: Reconstructs masked tokens from a small visible subset; produces rich general representations
-   - **MAEv2**: An improved MAE variant with enhanced decoder and target handling
+### 5) `linear_attention_vit-5_chnges.ipynb` — Final improved version
+What is refined in this final notebook:
+- Keeps the same requirement-aligned pipeline but improves checkpointing/selection
+- Adds explicit checkpoint/early-stop handling by MAE (with F1 tie-breaks), in addition to F1 tracking
+- Re-runs SSL pretraining + supervised fine-tuning and full benchmark table
 
-2. **Fine-tuning Phase**: The pretrained encoder is attached to dual heads (regression + classification) and fine-tuned end-to-end on labeled jet data, using combined MSE and cross-entropy loss with task-balancing weights.
+Key final results from this notebook:
+- **Linear Attention ViT (MAE-pretrained)** *(best overall linear-attention variant in this notebook)*:
+  - Accuracy **0.8845**
+  - Balanced Accuracy **0.8849**
+  - F1 **0.8845**
+  - ROC-AUC **0.9502**
+  - PR-AUC **0.9376**
+  - ECE **0.0321**
+  - MSE **429.7220**
+  - MAE **14.8667**
+  - R² **0.8529**
+- **Linear Attention ViT (SimMIM-pretrained)**:
+  - Accuracy **0.8740**, MSE **538.0564**
+- **Linear Attention ViT (MAEv2-pretrained)**:
+  - Accuracy **0.8245**, MSE **736.2875**
 
-![Two-Phase Training](images/Two-Phase%20Training.png)
+Notebook takeaway:
+- Final notebook shows major regression improvement with MAE-pretrained Linear Attention ViT while keeping strong classification.
 
-This two-phase approach enabled the model to learn general jet image features before specializing to the supervised task. The MAE-pretrained variant achieved the best combined regression and classification performance.
+---
 
-![SSL Pretraining Methods](images/SSL%20Pretraining%20Methods.png)
+## Overall Journey Summary (v1 → v5)
+- **v1**: first full pipeline works, but regression reporting/behavior needs improvement.
+- **v2**: benchmark framework established; Linear Attention ViT reaches strong classification (0.8740).
+- **v3**: richer metrics added (ROC-AUC, PR-AUC, ECE, balanced accuracy); instability becomes visible.
+- **v4**: pipeline aligned tightly to requirement (Linear-Attention SSL pretraining variants + fine-tuning).
+- **v5**: final improved checkpointing/selection gives strongest combined performance for MAE-pretrained Linear Attention ViT.
 
-### Multi-Architecture Benchmark
-Across notebook versions, a systematic multi-architecture comparison was performed:
+---
 
-| Architecture | Classification Strength | Regression Quality | Compute Cost |
-|---|---|---|---|
-| Standard ViT | Strong | Moderate | High |
-| Linear Attention ViT | Strong | Strong (with MAE pretrain) | Low |
-| L2ViT | Moderate | Moderate | Low |
-| XCiT | Moderate | Lower | Medium |
+## Reproducing the Journey
+Run notebooks in this exact order:
+1. `jupyter notebook/linear_attention_vit.ipynb`
+2. `jupyter notebook/linear_attention_vit-2.ipynb`
+3. `jupyter notebook/linear_attention_vit-3.ipynb`
+4. `jupyter notebook/linear_attention_vit-4.ipynb`
+5. `jupyter notebook/linear_attention_vit-5_chnges.ipynb`
 
-The progression across five notebook versions refined this benchmark:
-- **v1**: Single-model prototype; regression signal collapsed (R² ≈ 0)
-- **v2**: Multi-architecture benchmark; Linear Attention ViT showed ~0.874 accuracy
-- **v3**: Expanded evaluation suite (ROC-AUC, PR-AUC, ECE, balanced accuracy); exposed instability
-- **v4**: Improved pipeline alignment; SimMIM-pretrained linear attention improved balance
-- **v5 (final)**: Best overall result — MAE-pretrained Linear Attention ViT; regression substantially fixed
-
-![img-3](images/img-3.png)
-![img-4](images/img-4%20(2).png)
-
-## Results
-
-### Performance Comparison Across Versions
-
-| Version | Loss (MSE) | Accuracy | RMSE | Notes |
-|---|---:|---:|---:|---|
-| v1 | ~0.0000 (artifact) | 0.8160 | N/A | Regression signal unreliable (R²≈0) |
-| v2 | 1021.0089 | 0.8740 | 31.95 | Classification-strong benchmark |
-| v3 | 1532.8457 | 0.8250 | 39.15 | Instability exposed under richer metrics |
-| v4 | 1112.3878 | 0.8750 | 33.35 | SimMIM-pretrained improved balance |
-| **v5 (MAE-pretrained)** | **429.7220** | **0.8845** | **20.73** | **Best combined result** |
-
-### Final Model Performance (v5)
-- **Accuracy**: 0.8845
-- **R²**: 0.8529
-- **MSE**: 429.7220 (RMSE ≈ 20.73)
-
-The MAE-pretrained Linear Attention ViT in the final notebook achieved the best combined classification-regression balance, with regression quality improving dramatically (R² from ≈0 to 0.85) through improved preprocessing, loss design, and SSL pretraining.
-
-![Performance Comparison](images/Performance%20Comparison.png)
-
-![img-7](images/img-7.png)
-![img-8](images/img-8.png)
-
-## References
-- [Oracle-Preserving Latent Flows](https://arxiv.org/abs/2302.00806)
-- [Masked Autoencoders Are Scalable Vision Learners (MAE)](https://arxiv.org/abs/2111.06377)
-- [XCiT: Cross-Covariance Image Transformers](https://arxiv.org/abs/2106.09681)
-- [SimMIM: A Simple Framework for Masked Image Modeling](https://arxiv.org/abs/2111.09886)

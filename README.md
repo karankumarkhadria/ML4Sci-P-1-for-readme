@@ -110,6 +110,7 @@ The first notebook established the complete end-to-end pipeline for applying Vis
   3. **Scratch Training (50 epochs)**: Random initialization baseline for direct comparison — validation accuracy 81.60%, Val F1 (macro) 0.8160
 - **SSL Method**: MAE (`MaskedAutoEncoder`) decoder for pixel-level reconstruction pretraining
 - **Key Finding**: At 32×32 resolution the from-scratch model outperformed the pretrained-then-finetuned model (81.60% vs 75.30% accuracy), signalling that the pretraining strategy and image resolution needed to be rethought for subsequent notebooks.
+- **What was changed in Notebook 2 to improve**: Increased input resolution from 32×32 to 64×64, expanded embedding/model capacity (128D→256D; deeper encoder), moved from a single-model setup to a four-architecture benchmark, and introduced three SSL pretraining options (MAE, SimMIM, MAEv2) with stronger training utilities (warmup + cosine schedule, AMP, early stopping, uncertainty-weighted multitask loss).
 
 ---
 
@@ -129,6 +130,7 @@ The second notebook scaled up to 64×64 images and introduced a comprehensive co
 - **Training Utilities Added**: Cosine Annealing with linear warmup, Automatic Mixed Precision (AMP), early stopping (patience-based), uncertainty-weighted multi-task loss (Kendall et al.), and inference speed measurement
 - **Configuration**: 256D embeddings, 10 transformer blocks, 8 heads, 20 training epochs, batch size 32, LR 3e-4
 - **Key Observation**: Linear Attention ViT showed ~0.874 classification accuracy at substantially lower compute than Standard ViT, confirming it as the preferred candidate.
+- **What was changed in Notebook 3 to improve**: Added reproducibility/stability controls (`STRICT_DETERMINISM=False`, safer dataloader settings, gradient clipping, optional EMA), expanded evaluation with ROC-AUC/PR-AUC/ECE/balanced accuracy, and introduced multi-seed mean±std reporting to make model comparison more reliable.
 
 ---
 
@@ -151,6 +153,7 @@ The third notebook addressed reproducibility and instability issues uncovered in
   - **Phase B** (remaining epochs): Joint optimization with full CE + MSE loss
 - **Checkpoint Strategy**: Early stopping on validation macro-F1; lower MAE used as tie-breaker
 - **Run Modes**: `"debug"` for quick iteration, `"full"` for 35-epoch production runs; Huber loss and λ_reg sweep available
+- **What was changed in Notebook 4 to improve**: Refocused the pipeline to the required Linear Attention ViT only, formalized the strict project flow (pretrain each SSL method separately, save checkpoints, fine-tune, then compare against scratch), and added NaN-safe attention plus physics-aware preprocessing alignment.
 
 ---
 
@@ -171,6 +174,7 @@ The fourth notebook refocused exclusively on the Linear Attention ViT as specifi
   - MAEv2: loss = 0.4457, 11.41M params
 - **Reliability Improvements**: NaN-safe attention guards to prevent score explosion during pretraining, `PhysicsPreprocess` module for energy centroid alignment, backward-compatible class aliases for smooth iteration
 - **Phase A**: 5 epochs of head-only warmup before full joint training; 35 total epochs at 64×64 resolution
+- **What was changed in Notebook 5 to improve**: Unified attention implementation (`UnifiedLinearAttention`), added physics-informed auxiliary/statistical features (`EnergyProxyHead`, `compute_energy_proxies`, `compute_pt_stats`), extended warmup (Phase A 5→7), fixed regression scaling with `LAMBDA_REG=1.0` and normalized targets, and evaluated in denormalized physical units for better optimization and reporting.
 
 ---
 

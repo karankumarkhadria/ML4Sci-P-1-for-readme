@@ -95,6 +95,127 @@ The progression across five notebook versions refined this benchmark:
 ![img-3](images/img-3.png)
 ![img-4](images/img-4%20(2).png)
 
+## Journey of Notebooks
+
+The implementation evolved across five progressively refined notebooks, each building on the lessons of the previous one:
+
+### Notebook 1: `linear_attention_vit.ipynb` — Foundational Prototype
+
+The first notebook established the complete end-to-end pipeline for applying Vision Transformers to particle jet images, with a focus on validating the three-phase training strategy.
+
+- **Architecture**: `LinearAttentionViT` built on `CrossCovarianceAttention` (XCiT-style) blocks with `LocalPatchInteraction` (depth-wise convolutions) for spatial structure. The model contained ~1.25M parameters configured with 128D embeddings, 6 transformer layers, and 4 attention heads over 32×32 input images with 4×4 patches.
+- **Three-Phase Training**:
+  1. **Pretraining (30 epochs)**: Self-supervised MAE-style reconstruction on unlabeled data; reconstruction loss converged from 0.6529 → 0.0005
+  2. **Fine-tuning (50 epochs)**: Dual heads (regression + classification) attached to the pretrained encoder; encoder frozen for the first 12 epochs, then fully unfrozen — validation accuracy reached 75.30%
+  3. **Scratch Training (50 epochs)**: Random initialization baseline for direct comparison — validation accuracy 81.60%, Val F1 (macro) 0.8160
+- **SSL Method**: MAE (`MaskedAutoEncoder`) decoder for pixel-level reconstruction pretraining
+- **Key Finding**: At 32×32 resolution the from-scratch model outperformed the pretrained-then-finetuned model (81.60% vs 75.30% accuracy), signalling that the pretraining strategy and image resolution needed to be rethought for subsequent notebooks.
+- **What was changed in Notebook 2 to improve**: Increased input resolution from 32×32 to 64×64, expanded embedding/model capacity (128D→256D; deeper encoder), moved from a single-model setup to a four-architecture benchmark, and introduced three SSL pretraining options (MAE, SimMIM, MAEv2) with stronger training utilities (warmup + cosine schedule, AMP, early stopping, uncertainty-weighted multitask loss).
+
+---
+
+### Notebook 2: `linear_attention_vit-2.ipynb` — Multi-Architecture Benchmark
+
+The second notebook scaled up to 64×64 images and introduced a comprehensive comparison framework across four distinct ViT variants and three SSL strategies.
+
+- **Four Architectures Benchmarked**:
+  1. **Standard ViT** — full quadratic softmax attention O(N²d); strong but memory-intensive baseline
+  2. **Linear Attention ViT** — ReLU kernel feature maps O(Nd²); primary candidate
+  3. **L2ViT** — hybrid linear global + local window attention
+  4. **XCiT ViT** — cross-covariance attention O(Nd²)
+- **Three SSL Pretraining Methods**:
+  - **MAE**: reconstruction loss 0.0513, 8.9M params
+  - **SimMIM**: reconstruction loss 0.2560, 8.17M params
+  - **MAEv2**: improved MAE variant with enhanced decoder
+- **Training Utilities Added**: Cosine Annealing with linear warmup, Automatic Mixed Precision (AMP), early stopping (patience-based), uncertainty-weighted multi-task loss (Kendall et al.), and inference speed measurement
+- **Configuration**: 256D embeddings, 10 transformer blocks, 8 heads, 20 training epochs, batch size 32, LR 3e-4
+- **Key Observation**: Linear Attention ViT showed ~0.874 classification accuracy at substantially lower compute than Standard ViT, confirming it as the preferred candidate.
+- **What was changed in Notebook 3 to improve**: Added reproducibility/stability controls (`STRICT_DETERMINISM=False`, safer dataloader settings, gradient clipping, optional EMA), expanded evaluation with ROC-AUC/PR-AUC/ECE/balanced accuracy, and introduced multi-seed mean±std reporting to make model comparison more reliable.
+
+---
+
+### Notebook 3: `linear_attention_vit-3.ipynb` — Stability and Robust Metrics
+
+The third notebook addressed reproducibility and instability issues uncovered in NB2, while adding a richer evaluation suite for trustworthy reporting.
+
+- **Stability Enhancements**:
+  - `STRICT_DETERMINISM=False` to avoid CUBLAS workspace errors
+  - `num_workers=0`, `pin_memory=False` to prevent training hangs
+  - Gradient clipping (`max_norm=1.0`) to prevent exploding gradients
+  - Optional Exponential Moving Average (EMA) for smoother weight updates
+- **Advanced Evaluation Metrics**:
+  - Balanced Accuracy and Macro-F1 for imbalanced-class robustness
+  - ROC-AUC and PR-AUC for threshold-independent classification quality
+  - Expected Calibration Error (ECE) for model confidence evaluation
+- **Multi-Seed Robustness**: Full pipeline run across seeds {42, 52, 62}, reporting mean ± std for statistically meaningful comparisons
+- **Two-Phase Training Formalized**:
+  - **Phase A** (5 epochs): Classification-focused warmup with λ_reg ≈ 0 — heads learn to classify before regression is introduced
+  - **Phase B** (remaining epochs): Joint optimization with full CE + MSE loss
+- **Checkpoint Strategy**: Early stopping on validation macro-F1; lower MAE used as tie-breaker
+- **Run Modes**: `"debug"` for quick iteration, `"full"` for 35-epoch production runs; Huber loss and λ_reg sweep available
+- **What was changed in Notebook 4 to improve**: Refocused the pipeline to the required Linear Attention ViT only, formalized the strict project flow (pretrain each SSL method separately, save checkpoints, fine-tune, then compare against scratch), and added NaN-safe attention plus physics-aware preprocessing alignment.
+
+---
+
+### Notebook 4: `linear_attention_vit-4.ipynb` — Project-Aligned Linear-Only Pipeline
+
+The fourth notebook refocused exclusively on the Linear Attention ViT as specified in the GSoC project requirements, implementing the strict pretrain → fine-tune → scratch comparison workflow.
+
+- **Architecture**: `LinearAttentionViTEncoder` with `LinearSelfAttention` (ReLU kernel, O(Nd²)) exclusively — multi-architecture comparison removed to match project scope
+- **Strict Project Workflow**:
+  1. Pretrain the Linear Attention ViT encoder on unlabeled images for each SSL method independently
+  2. Save separate encoder checkpoints for MAE, SimMIM, and MAEv2
+  3. Fine-tune from each pretrained checkpoint at low learning rate
+  4. Train an equivalent model from random initialization
+  5. Compare all four variants on the same evaluation protocol
+- **SSL Pretraining Results**:
+  - MAE: loss = 0.3361, 9.83M params
+  - SimMIM: loss = 0.4651, 8.17M params
+  - MAEv2: loss = 0.4457, 11.41M params
+- **Reliability Improvements**: NaN-safe attention guards to prevent score explosion during pretraining, `PhysicsPreprocess` module for energy centroid alignment, backward-compatible class aliases for smooth iteration
+- **Phase A**: 5 epochs of head-only warmup before full joint training; 35 total epochs at 64×64 resolution
+- **What was changed in Notebook 5 to improve**: Unified attention implementation (`UnifiedLinearAttention`), added physics-informed auxiliary/statistical features (`EnergyProxyHead`, `compute_energy_proxies`, `compute_pt_stats`), extended warmup (Phase A 5→7), fixed regression scaling with `LAMBDA_REG=1.0` and normalized targets, and evaluated in denormalized physical units for better optimization and reporting.
+
+---
+
+### Notebook 5: `linear_attention_vit-5_chnges.ipynb` — Final Production Version
+
+The fifth and final notebook consolidated all prior improvements into the production-ready implementation, introducing new physics-aware components and achieving the best overall performance.
+
+- **New Architecture Components**:
+  - `UnifiedLinearAttention`: Consolidated, numerically stable linear attention module combining all prior fixes
+  - `EnergyProxyHead`: Physics-aware auxiliary head that estimates particle energy deposits directly from the patch representations
+- **Physics-Informed Features Added**:
+  - `compute_energy_proxies()`: Computes per-image particle energy estimates from detector pixel values
+  - `compute_pt_stats()`: Calculates transverse momentum statistics for physics-motivated feature enrichment
+  - Enhanced preprocessing pipeline with tighter physics normalization
+- **Training Refinements**:
+  - Phase A increased to 7 epochs (vs 5 in NB4) for more stable head warmup
+  - `LAMBDA_REG=1.0` enforced with normalized regression targets for consistent gradient scales
+  - Denormalization applied during evaluation so metrics (MSE, RMSE, R²) are reported in physical units
+  - Checkpoint and early-stop criterion switched to MAE (tie-break by F1) for better regression focus
+- **SSL Pretraining**:
+  - MAE: loss = 0.6671, 9.86M params
+  - SimMIM: loss = 0.5762, 8.20M params
+  - MAEv2: loss = 0.8806, 11.44M params
+- **Best Overall Performance**: The MAE-pretrained Linear Attention ViT achieved the best combined result — Accuracy 0.8845, R² = 0.8529, MSE = 429.72 (RMSE ≈ 20.73) — demonstrating that MAE pretraining delivers the strongest representations for this physics task.
+
+---
+
+### Notebook-to-Notebook Progression Summary
+
+| Aspect | NB1 | NB2 | NB3 | NB4 | NB5 |
+|--------|-----|-----|-----|-----|-----|
+| **Image size** | 32×32 | 64×64 | 64×64 | 64×64 | 64×64 |
+| **Embedding dim** | 128D | 256D | 256D | 256D | 256D |
+| **Architectures** | 1 (XCiT+Linear) | 4 (ViT/Linear/L2/XCiT) | 4 | 1 (Linear only) | 1 (Linear only) |
+| **SSL methods** | MAE | MAE, SimMIM, MAEv2 | MAE, SimMIM, MAEv2 | MAE, SimMIM, MAEv2 | MAE, SimMIM, MAEv2 |
+| **Phase A warmup** | — | — | 5 epochs | 5 epochs | 7 epochs |
+| **Multi-seed eval** | No | No | Yes (42, 52, 62) | No | No |
+| **Physics features** | Basic | Basic | Basic | PhysicsPreprocess | + EnergyProxyHead, pt_stats |
+| **AMP / gradient clip** | No | AMP | AMP + clip | Clip | Clip |
+| **Focus** | Prototype | Arch benchmark | Stability & metrics | Task-aligned | Final production |
+
 ## Results
 
 ### Performance Comparison Across Versions

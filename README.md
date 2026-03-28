@@ -7,7 +7,7 @@ This README documents the notebook journey for the GSoC implementation using onl
 2. `linear_attention_vit-2.ipynb`
 3. `linear_attention_vit-3.ipynb`
 4. `linear_attention_vit-4.ipynb`
-5. `linear_attention_vit-5_chnges.ipynb` *(final notebook in this repository for step 5)*
+5. `linear_attention_vit-5_chnges.ipynb` *(this exact `chnges` spelling is the current filename in the repository; final notebook for step 5)*
 
 ---
 
@@ -37,7 +37,9 @@ What is implemented in this notebook:
 What was observed in outputs:
 - Finetuned model reports `Final Val Acc: 81.05%`
 - Scratch model reports `Final Val Acc: 81.60%`
-- Validation MSE is shown as `0.0000` in this notebook’s logging outputs, and comparison block shows pretraining not helping classification in this run
+- Validation MSE is logged as `0.0000` in this notebook’s printed outputs.
+- In the notebook flow this is treated as an unreliable/degenerate regression signal for this version.
+- The comparison block also shows pretraining not helping classification in this run.
 
 Notebook takeaway:
 - Pipeline works end-to-end, but regression behavior in this version is not yet reliable and later notebooks refine it.
@@ -151,5 +153,5 @@ Run notebooks in this exact order:
 2. `jupyter notebook/linear_attention_vit-2.ipynb`
 3. `jupyter notebook/linear_attention_vit-3.ipynb`
 4. `jupyter notebook/linear_attention_vit-4.ipynb`
-5. `jupyter notebook/linear_attention_vit-5_chnges.ipynb`
+5. `jupyter notebook/linear_attention_vit-5_chnges.ipynb` *(uses repository’s current filename spelling)*
 

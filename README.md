@@ -4,19 +4,19 @@ This folder contains implementations for efficient Vision Transformer-based anal
 
 ## Task Overview
 
-### Task 1: Dataset Preparation and Preprocessing
+### STEP_1: Dataset Preparation and Preprocessing
 - **Data Loading**: Reading HDF5 detector images of quark/gluon jets
 - **Physics-Aware Preprocessing**: Energy centroid alignment, normalization, and safe augmentation strategies
 
-### Task 2: Linear Attention ViT — Multitask Learning
+### STEP_2: Linear Attention ViT — Multitask Learning
 - Building and training a Linear Attention Vision Transformer for simultaneous:
   - **Regression**: predicting jet mass
   - **Classification**: identifying quark vs gluon jets
 
-### Task 3: SSL Pretraining and Fine-tuning
+### STEP_3: SSL Pretraining and Fine-tuning
 - Using self-supervised learning methods (SimMIM, MAE, MAEv2) to pretrain the Linear Attention ViT before supervised fine-tuning on labeled data
 
-### Bonus Task
+### STEP_4: Multi-architecture benchmarking
 - Multi-architecture benchmarking (Standard ViT, Linear Attention ViT, L2ViT, XCiT) and building a physics-informed model using the learned representations
 
 ## Implementation Details

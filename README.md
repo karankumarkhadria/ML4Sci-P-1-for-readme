@@ -134,13 +134,13 @@ The final pipeline integrates:
 ![Proposal Architecture](images/proposal_architecture.png)
 ![Proposal Timeline](images/proposal_timeline.png)
 ![Notebook Progress Plan](images/proposal_notebook_progress.png)
-![Six Key Improvements](images/Six%20Key%20Improvements.png)
+![Six Key Improvements](<images/Six Key Improvements.png>)
 
 ### Data and feature/training pipeline views
-![Data Distribution & Reproducibility](images/Data%20Distribution%20%26%20Reproducibility%20.png)
-![Feature Engineering and Model Architecture](images/feature%20engineering%20and%20model%20archi.png)
-![Training Flowchart](images/training%20flowchart.png)
-![Evaluation Metrics Flowchart](images/evaluation%20metrics%20flowchart.png)
+![Data Distribution & Reproducibility](<images/Data Distribution & Reproducibility .png>)
+![Feature Engineering and Model Architecture](<images/feature engineering and model archi.png>)
+![Training Flowchart](<images/training flowchart.png>)
+![Evaluation Metrics Flowchart](<images/evaluation metrics flowchart.png>)
 
 ### Core architecture and performance evidence
 ![Architecture](images/architecture.png)

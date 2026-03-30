@@ -1,51 +1,44 @@
 # Event Classification with Masked Transformer Autoencoders
 
 ## Overview
-This repository documents a full notebook-driven research journey for **jet event classification** in the ML4Sci/CMS context using a hybrid deep learning approach.
+This repository documents a notebook-first research journey for **jet event classification** in the ML4SCI/CMS setting.
 
-The core idea is to combine:
-- **L-GATr-style Lorentz-aware modeling** for physics-aware representation learning,
-- **ParT-style transformer components** for particle sequence understanding,
-- **Masked Autoencoder (MAE) pretraining** to improve downstream classification quality and stability.
+The full workflow is developed and improved through the notebook series in `notebook/`, where each next notebook refines training stability, model quality, and evaluation reliability.
 
-This README is intentionally designed as a **narrative project report** (not just image dumps), so readers can understand the motivation, progression, decisions, and outcomes notebook by notebook.
+The model direction combines:
+- Lorentz-aware modeling ideas,
+- transformer-based particle interaction modeling,
+- masked autoencoder (MAE) pretraining before supervised fine-tuning.
 
 ---
 
 ## Why this project matters
-In jet physics classification tasks, model quality is judged not only by final accuracy/AUC but also by:
-1. **Training stability** across random seeds,
-2. **Data efficiency and representation quality**,
-3. **Robustness of performance gains** under ablations.
-
-This work explores whether MAE pretraining and iterative architecture refinements produce measurable gains in these dimensions.
-
----
-
-## Problem setup
-- **Dataset scale:** 100,000 events
-- **Split:** 80% train / 10% validation / 10% test
-- **Task type:** Multi-class event classification (JetClass-style setup)
-- **Main targets:**
-  - improve hybrid architecture quality (accuracy + AUC),
-  - improve consistency across runs,
-  - quantify MAE pretraining gains via controlled ablations,
-  - track practical training-speed improvements in the final version.
+For this problem, good results are not just a single final score.
+This work tracks three practical goals across notebook iterations:
+1. Better classification performance (accuracy and macro AUC),
+2. Better run-to-run stability across random seeds,
+3. Better evidence through ablations and structured comparisons.
 
 ---
 
-## Implementation approach
-This project was implemented as an iterative notebook pipeline, where each stage solved one concrete limitation seen in the previous stage.  
-Instead of trying to optimize everything at once, the approach was: stabilize training first, then improve representation quality, then improve evaluation reliability.
+## Problem setup (as used in notebooks)
+- Dataset size used in workflow: `100,000` events
+- Data split: `80%` train / `10%` validation / `10%` test
+- Task: multi-class jet event classification
+- Notebook objective: improve baseline pipeline in measurable, reproducible steps
 
-Implementation strategy used in this repo:
-- Start from a working hybrid baseline (Lorentz-aware + transformer blocks).
-- Add MAE pretraining before classification fine-tuning.
-- Track both **performance** (accuracy/AUC) and **stability** (seed variance).
-- Use ablation runs to verify whether each change actually helps.
-- Keep only changes that improve quality consistently across multiple runs.
+---
 
-This step-by-step approach made the final model stronger and also more reproducible.
+## Implementation approach (notebook-driven)
+The repository was developed as an iterative notebook pipeline instead of one-shot optimization.
+
+High-level flow followed in the notebooks:
+- Build a baseline hybrid architecture and full training/evaluation path,
+- Add MAE pretraining and compare against no-pretraining baselines,
+- Add multi-seed analysis to reduce single-run bias,
+- Consolidate improvements in later notebooks and finalize benchmark settings.
+
+This progression is what produced the final performance jump and improved consistency.
 
 ---
 
@@ -55,57 +48,55 @@ From `notebook/6-Hybrid_LorentzParT_MAE_GSoC2026_FINAL -.ipynb`:
 - **Macro AUC (OvR):** `0.9536`
 - **Macro AUC (OvO):** `0.9536`
 
-### MAE pretraining effect (final summary)
+### MAE pretraining effect (final notebook summary)
 - **Accuracy gain:** `+0.0282` (~+2.8%)
 - **AUC gain:** `+0.0070`
-- **Variance reduction:** reported as **~4.5x lower variance** with pretraining
+- Reported as substantially lower variance with pretraining in multi-seed comparisons
 
 ---
 
 ## Notebook Journey (research progression)
-The heart of this repository is the notebook sequence. Each notebook captures a meaningful step in the model evolution.
+Each notebook is a concrete stage in the model evolution.
 
 | Notebook | What changed in this stage | Reported test accuracy | Reported macro AUC (OvR) |
 |---|---|---:|---:|
-| `1-Hybrid_Lorentz_ParT_MAE_JetClass_GSoC2026.ipynb` | Baseline full hybrid MAE pipeline + first ablation set | `0.6467` | `0.938316` |
-| `2-Hybrid_Lorentz_ParT_MAE_JetClass_GSoC2026 .ipynb` | Scheduler/logging updates + expanded multi-seed evaluation structure | `0.6093` | `0.9267` |
-| `3-Hybrid_Lorentz_ParT_MAE_JetClass_GSoC2026.ipynb` | Mass-target normalization + training behavior tuning | `0.6464` | `0.9393` |
-| `3_v6-Hybrid_Lorentz_ParT_MAE_JetClass_GSoC2026.ipynb` | Strong leap from improved pretraining + longer fine-tuning | `0.7018` | `0.9524` |
-| `4-Hybrid_Lorentz_ParT_MAE_JetClass_GSoC2026.ipynb` | Consolidation and robust seeded comparison | `0.6968` | `0.9521` |
-| `6-Hybrid_LorentzParT_MAE_GSoC2026_FINAL -.ipynb` | Final polished benchmark pipeline | **`0.7020`** | **`0.9536`** |
+| `1-Hybrid_Lorentz_ParT_MAE_JetClass_GSoC2026.ipynb` | Initial complete hybrid MAE pipeline with baseline ablations/diagnostics | `0.6467` | `0.938316` |
+| `2-Hybrid_Lorentz_ParT_MAE_JetClass_GSoC2026 .ipynb` | Added stronger scheduler/logging organization and explicit multi-seed evaluation structure | `0.6093` | `0.9267` |
+| `3-Hybrid_Lorentz_ParT_MAE_JetClass_GSoC2026.ipynb` | Added mass-target normalization and training behavior tuning | `0.6464` | `0.9393` |
+| `3_v6-Hybrid_Lorentz_ParT_MAE_JetClass_GSoC2026.ipynb` | Stronger pretraining + longer fine-tuning strategy | `0.7018` | `0.9524` |
+| `4-Hybrid_Lorentz_ParT_MAE_JetClass_GSoC2026.ipynb` | Consolidated improvements and stricter seeded robustness checks | `0.6968` | `0.9521` |
+| `6-Hybrid_LorentzParT_MAE_GSoC2026_FINAL -.ipynb` | Final polished benchmark configuration | **`0.7020`** | **`0.9536`** |
 
 ### Interpreting the journey
-- The path is **not strictly monotonic** in every intermediate step, which is expected in experimental ML.
-- The key milestone is the transition to stronger pretraining/fine-tuning strategy (`3_v6` onward), where both accuracy and AUC jump significantly.
-- Final runs preserve this gain and improve consistency.
+- Intermediate steps are not strictly monotonic, which is expected in real experimentation.
+- The major jump appears in the `3_v6` stage onward.
+- Final notebooks preserve these gains while improving reproducibility discipline.
 
 ### What was changed in each next notebook to improve implementation
-Below is the practical transition logic from one notebook to the next:
-
 - **NB1 → NB2**
-  - Added better scheduler/logging structure and multi-seed evaluation pattern.
-  - Goal: improve monitoring and make comparisons more reliable.
+  - Added clearer scheduler/logging flow and explicit multi-seed evaluation block.
+  - Improvement target: better reliability and easier apples-to-apples comparisons.
 
 - **NB2 → NB3**
-  - Added mass-target normalization and tuned training behavior.
-  - Goal: recover performance and improve feature scaling behavior.
+  - Added mass-target normalization and tuning updates.
+  - Improvement target: recover performance and improve feature-scale handling.
 
 - **NB3 → NB3_v6**
-  - Strengthened pretraining and extended fine-tuning strategy.
-  - Goal: improve representation quality before supervised learning.
+  - Strengthened MAE pretraining and extended fine-tuning strategy.
+  - Improvement target: improve latent representation quality before supervised optimization.
 
 - **NB3_v6 → NB4**
-  - Consolidated improvements and tested seeded robustness more strictly.
-  - Goal: ensure gains are stable, not just single-run effects.
+  - Consolidated successful changes and enforced stronger seeded checks.
+  - Improvement target: verify gains are stable across runs.
 
 - **NB4 → NB6 (Final)**
-  - Polished full benchmark pipeline and optimization settings.
-  - Goal: maximize final score while preserving reproducibility.
+  - Finalized benchmark configuration and optimization stack.
+  - Improvement target: maximize final score while preserving reproducibility.
 
 ---
 
 ## Stability & reproducibility evidence
-From `notebook/4-Hybrid_Lorentz_ParT_MAE_JetClass_GSoC2026.ipynb` multi-seed outputs:
+From `notebook/4-Hybrid_Lorentz_ParT_MAE_JetClass_GSoC2026.ipynb` multi-seed summary:
 
 - **With pretraining:**
   - `test_acc = 0.6993 ± 0.0013`
@@ -115,59 +106,62 @@ From `notebook/4-Hybrid_Lorentz_ParT_MAE_JetClass_GSoC2026.ipynb` multi-seed out
   - `test_acc = 0.6866 ± 0.0059`
   - `test_auc_ovr = 0.9490 ± 0.0014`
 
-### Key takeaway
-Pretraining improves **both**:
-- the average metric values (better central performance), and
-- the spread across seeds (better run-to-run reliability).
+Key point: pretraining improves both average performance and run-to-run stability.
 
 ---
 
 ## Ablation insights
-From final ablation outputs:
+From final notebook ablation outputs:
 - `with_mae_pretrain`: `val_acc = 0.5961`, `val_auc = 0.919528`
 - `no_mae_pretrain`: `val_acc = 0.5726`, `val_auc = 0.911468`
 
-These ablations are directionally consistent with final test-set trends and support the central project claim: **MAE pretraining is beneficial for downstream event classification** in this setup.
+These ablations are consistent with final test trends and support the core project claim that MAE pretraining helps downstream classification quality.
 
 ---
 
-## Architecture and training design (high level)
-The final iteration tracks these integrated decisions:
-- richer feature handling and normalization,
-- hybrid fusion checks with attention gating,
+## Architecture and training design notes (from notebook sections)
+The final pipeline integrates:
+- hybrid branch design with attention-gated fusion,
 - MAE pretraining followed by supervised fine-tuning,
-- CLS-style pooling/class-attention design choices,
-- engineering-oriented speed options (`torch.compile`, cuDNN benchmark settings).
+- class-attention/CLS-style decision structure,
+- optional mass-regression study branch,
+- engineering optimizations (`torch.compile`, cuDNN benchmark usage in final notebook).
 
 ---
 
-## Visual journey (curated)
-To keep this README content-first, only the most useful images are kept below.
+## Visual notebook journey
+### Proposal and planning visuals
+![Proposal Architecture](images/proposal_architecture.png)
+![Proposal Timeline](images/proposal_timeline.png)
+![Notebook Progress Plan](images/proposal_notebook_progress.png)
+![Six Key Improvements](<images/Six Key Improvements.png>)
 
-### Core architecture view
+### Data and feature/training pipeline views
+![Data Distribution & Reproducibility](<images/Data Distribution & Reproducibility .png>)
+![Feature Engineering and Model Architecture](<images/feature engineering and model archi.png>)
+![Training Flowchart](<images/training flowchart.png>)
+![Evaluation Metrics Flowchart](<images/evaluation metrics flowchart.png>)
+
+### Core architecture and performance evidence
 ![Architecture](images/architecture.png)
-
-### Training behavior and evaluation quality
+![Gate Analysis](images/gate_analysis.png)
 ![Pretraining curves](images/pretraining_curves.png)
 ![Finetuning curves](images/finetuning_curves.png)
 ![Per-class metrics](images/per_class_metrics.png)
 ![Multi-seed comparison](images/multiseed_comparison.png)
 
-These figures are enough to understand model design, learning dynamics, and reproducibility without overwhelming the page.
-
 ---
 
 ## Repository structure
-- `notebook/` — complete experiment lifecycle and final benchmark notebooks
-- `images/` — architecture, curves, and analysis visuals
-- `Research paper/` — foundational reading material
-- `README.md` — this narrative summary
-- `readme (1).md` — older/alternate draft context
+- `notebook/` — complete notebook lifecycle from baseline to final benchmark
+- `images/` — all plots and explanatory figures used in this README
+- `Research paper/` — local reference PDFs
+- `README.md` — notebook-driven narrative summary
+- `readme (2).md` — format/style reference used for this README rewrite
 
 ---
 
-## How to read/reproduce this work
-Follow notebooks in this order to match the evolution path:
+## How to read this work in order
 1. `notebook/1-Hybrid_Lorentz_ParT_MAE_JetClass_GSoC2026.ipynb`
 2. `notebook/2-Hybrid_Lorentz_ParT_MAE_JetClass_GSoC2026 .ipynb`
 3. `notebook/3-Hybrid_Lorentz_ParT_MAE_JetClass_GSoC2026.ipynb`
@@ -175,39 +169,16 @@ Follow notebooks in this order to match the evolution path:
 5. `notebook/4-Hybrid_Lorentz_ParT_MAE_JetClass_GSoC2026.ipynb`
 6. `notebook/6-Hybrid_LorentzParT_MAE_GSoC2026_FINAL -.ipynb`
 
-Recommended reading pattern per notebook:
-1. configuration and preprocessing cells,
-2. pretraining/fine-tuning setup,
-3. metric tables and confusion/per-class outputs,
-4. ablation and seeded comparison sections,
-5. final summary blocks.
-
----
-
-## Research foundations and external context
-Local references in this repo:
-- [`Research paper/Research paper 1.pdf`](Research%20paper/Research%20paper%201.pdf) — Lorentz-Equivariant Geometric Algebra Transformers (L-GATr)
-- [`Research paper/Reseach paper 2.pdf`](Research%20paper/Reseach%20paper%202.pdf) — Particle Transformer / JetClass context
-
-External context used in project framing:
-- GSoC 2025 write-up: https://medium.com/@thanhnguyen14401/gsoc-2025-with-ml4sci-event-classification-with-masked-transformer-autoencoders-6da369d42140
-- Prior ML4SCI/CMS code context: https://github.com/ML4SCI/CMS/tree/main/MAEs/Hybrid_Transformer_Thanh_Nguyen
-- Dataset source utility reference: https://github.com/jet-universe/particle_transformer/blob/main/get_datasets.py
+Recommended pattern per notebook:
+1. introduction/improvement and scope,
+2. model/data sections,
+3. pretraining/fine-tuning outputs,
+4. ablation and multi-seed outputs,
+5. final discussion block.
 
 ---
 
 ## Conclusion
-This repository demonstrates an end-to-end experimental journey from baseline hybrid modeling to a stronger final benchmark, with evidence that MAE pretraining improves both **performance** and **stability**.
+This repository shows a full notebook-to-benchmark journey where MAE pretraining and iterative architecture/training refinements improved both quality and stability.
 
-The final notebook result (`0.7020` accuracy, `0.9536` macro AUC) is best understood not as a one-off number, but as the endpoint of iterative design, ablation validation, and multi-seed reliability analysis.
-
-## Next steps for the next notebook
-The next notebook can focus on fewer but higher-impact experiments. A good direction is to improve class imbalance handling and calibration while preserving the current stability gains.
-
-Suggested next-step points:
-- add class-balanced or focal-style loss comparison,
-- test stronger augmentation for hard classes only,
-- run confidence calibration checks (ECE/reliability plots),
-- include error analysis by confusion clusters,
-- benchmark inference speed/memory with batch-size sweeps,
-- keep the same multi-seed protocol so improvements stay comparable.
+The final notebook result (`0.7020` accuracy, `0.9536` macro AUC) is the endpoint of staged improvements rather than a single isolated run.

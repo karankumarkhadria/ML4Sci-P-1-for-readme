@@ -42,6 +42,31 @@ This progression is what produced the final performance jump and improved consis
 
 ---
 
+## Notebook-derived project explanation
+This project addresses **jet tagging at the LHC**, where each collision event produces jets that must be classified into physics categories such as Higgs/top/W/Z or QCD background. In the final notebook narrative, the central idea is that stronger event representations before supervised training can improve both final classification quality and seed-to-seed robustness.
+
+The approach uses **masked autoencoder pretraining** on particle-level inputs first, then performs supervised fine-tuning for jet class prediction. This follows the practical logic that pretraining can learn generic particle-structure patterns before the classifier is optimized for the target labels.
+
+The model design combines transformer-style interaction modeling with Lorentz-aware inductive bias in a hybrid pipeline. Notebook ablations and multi-seed summaries are used as evidence that gains are not only from one lucky run, but are supported by structured comparisons.
+
+### Point-wise explanation of the notebook workflow
+- **Problem motivation:** Jet tagging quality directly impacts physics-analysis sensitivity, so both performance and reliability are important.
+- **Data pipeline goal:** Keep train/validation/test handling explicit and reproducible across notebook iterations.
+- **Representation-learning step:** Use MAE pretraining to build stronger latent features before classification.
+- **Supervised step:** Fine-tune the hybrid classifier and monitor macro AUC/accuracy for model selection.
+- **Ablation step:** Compare with/without pretraining and branch variants to isolate what actually helps.
+- **Stability step:** Re-run with multiple random seeds and report mean ± std to reduce single-run bias.
+- **Finalization step:** Consolidate successful settings into the final benchmark notebook configuration.
+
+### Point-wise explanation of what improved across iterations
+- **Training stability improved** through better scheduler/selection flow and more disciplined evaluation blocks.
+- **Feature handling improved** through normalization and iterative tuning updates.
+- **Pretraining impact became clearer** with stronger pretraining + longer fine-tuning strategy in later stages.
+- **Evidence quality improved** by adding multi-seed reporting and explicit ablation comparisons.
+- **Final metrics improved** while preserving reproducibility checks rather than optimizing only one run.
+
+---
+
 ## Final headline results
 From `notebook/6-Hybrid_LorentzParT_MAE_GSoC2026_FINAL -.ipynb`:
 - **Test Accuracy:** `0.7020` (70.2%)

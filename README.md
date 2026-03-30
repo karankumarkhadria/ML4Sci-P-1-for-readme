@@ -44,6 +44,10 @@ In the final notebook implementation, the approach is intentionally split into a
 
 At implementation level, the architecture combines a ParT-style interaction branch and a Lorentz-aware branch, then uses attention-gated fusion to combine complementary signals instead of relying on a single representation pathway. The final notebook also documents practical engineering details used during runs, including compile/acceleration helpers, explicit numerical safeguards in feature construction, and disciplined validation-based model selection (macro AUC first, with accuracy fallback when needed).
 
+The notebook implementation also emphasizes why each engineering choice exists. Log-normalized kinematic features and pairwise ParT-style features are used to reduce scale mismatch and make interaction structure easier for the model to learn. In pretraining, the masked reconstruction objective is feature-aware (including angular handling for `phi`) so that the learned latent space reflects particle-level geometry instead of only optimizing a generic loss. During supervised fine-tuning, checkpointing tracks macro AUC first to stay aligned with multi-class discrimination quality, while an explicit accuracy fallback protects training control flow when AUC cannot be computed for a specific epoch.
+
+Another practical part of the approach is reliability-focused optimization: speed helpers (`torch.compile` with fallback behavior) and cuDNN benchmarking are used to accelerate iteration without changing model semantics, while multi-seed evaluation is used to confirm that gains are not from a single favorable initialization. This implementation discipline is important in the notebook workflow because every stage is compared against prior stages using the same split logic and metric definitions.
+
 ### Detailed section-wise content (from final notebook only)
 From `notebook/6-Hybrid_LorentzParT_MAE_GSoC2026_FINAL -.ipynb`, the workflow is explicitly organized as:
 
@@ -228,6 +232,13 @@ Notebook-section design notes:
 - **Fusion intent:** attention-gated combination is used to blend branch information while keeping useful complementary signals.
 - **Training strategy:** two-stage flow (self-supervised pretraining → supervised fine-tuning) is kept explicit and measured with comparable evaluation blocks.
 - **Evaluation discipline:** model selection and reporting emphasize macro AUC + accuracy with seeded checks and per-class inspection instead of a single scalar score.
+
+### Approach breakdown (implementation-centric)
+- **Data and representation approach:** use event-level particle tensors with physics-guided feature engineering (`px, py, pz, E`, derived kinematics, pairwise ParT features) plus masking utilities for self-supervised learning.
+- **Modeling approach:** keep two complementary branches (ParT interactions and Lorentz-aware mixing), then fuse them with learned gates before class-attention-based final decision layers.
+- **Optimization approach:** train in two phases (pretraining then fine-tuning), retain reusable utilities (scheduler/checkpoint helpers), and apply acceleration toggles that do not alter objective definitions.
+- **Validation approach:** select models with macro AUC (OvR) as primary signal, keep accuracy as a robust fallback, and report multi-seed mean ± std to support reproducibility claims.
+- **Ablation approach:** isolate individual contributors (hybridization and MAE pretraining) with controlled comparisons before reporting final benchmark results.
 
 ![Architecture](images/architecture.png)
 ![Gate Analysis](images/gate_analysis.png)

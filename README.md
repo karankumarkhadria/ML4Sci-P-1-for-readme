@@ -40,6 +40,10 @@ High-level flow followed in the notebooks:
 
 This progression is what produced the final performance jump and improved consistency.
 
+In the final notebook implementation, the approach is intentionally split into a two-stage training lifecycle: masked reconstruction pretraining first, then supervised fine-tuning on jet labels. This design is used so the model learns general particle-structure priors before the classification objective is applied, which is consistent with the notebook discussion around stability and transfer of useful representations.
+
+At implementation level, the architecture combines a ParT-style interaction branch and a Lorentz-aware branch, then uses attention-gated fusion to combine complementary signals instead of relying on a single representation pathway. The final notebook also documents practical engineering details used during runs, including compile/acceleration helpers, explicit numerical safeguards in feature construction, and disciplined validation-based model selection (macro AUC first, with accuracy fallback when needed).
+
 ### Detailed section-wise content (from final notebook only)
 From `notebook/6-Hybrid_LorentzParT_MAE_GSoC2026_FINAL -.ipynb`, the workflow is explicitly organized as:
 
@@ -261,3 +265,13 @@ Recommended pattern per notebook:
 This repository shows a full notebook-to-benchmark journey where MAE pretraining and iterative architecture/training refinements improved both quality and stability.
 
 The final notebook result (`0.7020` accuracy, `0.9536` macro AUC) is the endpoint of staged improvements rather than a single isolated run.
+
+---
+
+## References (from final notebook)
+- Qu et al. (2022). *Particle Transformer for Jet Tagging.* [arXiv:2202.03772](https://arxiv.org/abs/2202.03772)
+- Spinner et al. (2024). *Lorentz-Equivariant Geometric Algebra Transformers for High-Energy Physics.* [arXiv:2405.14806](https://arxiv.org/abs/2405.14806)
+- He et al. (2022). *Masked Autoencoders Are Scalable Vision Learners.* CVPR 2022. [arXiv:2111.06377](https://arxiv.org/abs/2111.06377)
+- Bardes et al. (2022). *VICReg: Variance-Invariance-Covariance Regularization.* ICLR 2022. [arXiv:2105.04906](https://arxiv.org/abs/2105.04906)
+- Touvron et al. (2021). *Going deeper with Image Transformers (CaiT).* ICCV 2021. [arXiv:2103.17239](https://arxiv.org/abs/2103.17239)
+- Nguyen (2025). *GSoC 2025 — Event Classification with Masked Transformer Autoencoders.* [Medium](https://medium.com/@thanhnguyen14401/gsoc-2025-with-ml4sci-event-classification-with-masked-transformer-autoencoders-6da369d42140)

@@ -40,6 +40,14 @@ High-level flow followed in the notebooks:
 
 This progression is what produced the final performance jump and improved consistency.
 
+In the final notebook implementation, the approach is intentionally split into a two-stage training lifecycle: masked reconstruction pretraining first, then supervised fine-tuning on jet labels. This design is used so the model learns general particle-structure priors before the classification objective is applied, which is consistent with the notebook discussion around stability and transfer of useful representations.
+
+At implementation level, the architecture combines a ParT-style interaction branch and a Lorentz-aware branch, then uses attention-gated fusion to combine complementary signals instead of relying on a single representation pathway. The final notebook also documents practical engineering details used during runs, including compile/acceleration helpers, explicit numerical safeguards in feature construction, and disciplined validation-based model selection (macro AUC first, with accuracy fallback when needed).
+
+The notebook implementation also emphasizes why each engineering choice exists. Log-normalized kinematic features and pairwise ParT-style features are used to reduce scale mismatch and make interaction structure easier for the model to learn. In pretraining, the masked reconstruction objective is feature-aware (including angular handling for `phi`) so that the learned latent space reflects particle-level geometry instead of only optimizing a generic loss. During supervised fine-tuning, checkpointing tracks macro AUC first to stay aligned with multi-class discrimination quality, while an explicit accuracy fallback protects training control flow when AUC cannot be computed for a specific epoch.
+
+Another practical part of the approach is reliability-focused optimization: speed helpers (`torch.compile` with fallback behavior) and cuDNN benchmarking are used to accelerate iteration without changing model semantics, while multi-seed evaluation is used to confirm that gains are not from a single favorable initialization. This implementation discipline is important in the notebook workflow because every stage is compared against prior stages using the same split logic and metric definitions.
+
 ### Detailed section-wise content (from final notebook only)
 From `notebook/6-Hybrid_LorentzParT_MAE_GSoC2026_FINAL -.ipynb`, the workflow is explicitly organized as:
 
@@ -225,6 +233,13 @@ Notebook-section design notes:
 - **Training strategy:** two-stage flow (self-supervised pretraining → supervised fine-tuning) is kept explicit and measured with comparable evaluation blocks.
 - **Evaluation discipline:** model selection and reporting emphasize macro AUC + accuracy with seeded checks and per-class inspection instead of a single scalar score.
 
+### Approach breakdown (implementation-centric)
+- **Data and representation approach:** use event-level particle tensors with physics-guided feature engineering (`px, py, pz, E`, derived kinematics, pairwise ParT features) plus masking utilities for self-supervised learning.
+- **Modeling approach:** keep two complementary branches (ParT interactions and Lorentz-aware mixing), then fuse them with learned gates before class-attention-based final decision layers.
+- **Optimization approach:** train in two phases (pretraining then fine-tuning), retain reusable utilities (scheduler/checkpoint helpers), and apply acceleration toggles that do not alter objective definitions.
+- **Validation approach:** select models with macro AUC (OvR) as primary signal, keep accuracy as a robust fallback, and report multi-seed mean ± std to support reproducibility claims.
+- **Ablation approach:** isolate individual contributors (hybridization and MAE pretraining) with controlled comparisons before reporting final benchmark results.
+
 ![Architecture](images/architecture.png)
 ![Gate Analysis](images/gate_analysis.png)
 ![Per-class metrics](images/per_class_metrics.png)
@@ -261,3 +276,13 @@ Recommended pattern per notebook:
 This repository shows a full notebook-to-benchmark journey where MAE pretraining and iterative architecture/training refinements improved both quality and stability.
 
 The final notebook result (`0.7020` accuracy, `0.9536` macro AUC) is the endpoint of staged improvements rather than a single isolated run.
+
+---
+
+## References (from final notebook)
+- Qu et al. (2022). *Particle Transformer for Jet Tagging.* [arXiv:2202.03772](https://arxiv.org/abs/2202.03772)
+- Spinner et al. (2024). *Lorentz-Equivariant Geometric Algebra Transformers for High-Energy Physics.* [arXiv:2405.14806](https://arxiv.org/abs/2405.14806)
+- He et al. (2022). *Masked Autoencoders Are Scalable Vision Learners.* CVPR 2022. [arXiv:2111.06377](https://arxiv.org/abs/2111.06377)
+- Bardes et al. (2022). *VICReg: Variance-Invariance-Covariance Regularization.* ICLR 2022. [arXiv:2105.04906](https://arxiv.org/abs/2105.04906)
+- Touvron et al. (2021). *Going deeper with Image Transformers (CaiT).* ICCV 2021. [arXiv:2103.17239](https://arxiv.org/abs/2103.17239)
+- Nguyen (2025). *GSoC 2025 — Event Classification with Masked Transformer Autoencoders.* [Medium](https://medium.com/@thanhnguyen14401/gsoc-2025-with-ml4sci-event-classification-with-masked-transformer-autoencoders-6da369d42140)

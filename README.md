@@ -34,6 +34,21 @@ This work explores whether MAE pretraining and iterative architecture refinement
 
 ---
 
+## Implementation approach
+This project was implemented as an iterative notebook pipeline, where each stage solved one concrete limitation seen in the previous stage.  
+Instead of trying to optimize everything at once, the approach was: stabilize training first, then improve representation quality, then improve evaluation reliability.
+
+Implementation strategy used in this repo:
+- Start from a working hybrid baseline (Lorentz-aware + transformer blocks).
+- Add MAE pretraining before classification fine-tuning.
+- Track both **performance** (accuracy/AUC) and **stability** (seed variance).
+- Use ablation runs to verify whether each change actually helps.
+- Keep only changes that improve quality consistently across multiple runs.
+
+This step-by-step approach made the final model stronger and also more reproducible.
+
+---
+
 ## Final headline results
 From `notebook/6-Hybrid_LorentzParT_MAE_GSoC2026_FINAL -.ipynb`:
 - **Test Accuracy:** `0.7020` (70.2%)
@@ -63,6 +78,29 @@ The heart of this repository is the notebook sequence. Each notebook captures a 
 - The path is **not strictly monotonic** in every intermediate step, which is expected in experimental ML.
 - The key milestone is the transition to stronger pretraining/fine-tuning strategy (`3_v6` onward), where both accuracy and AUC jump significantly.
 - Final runs preserve this gain and improve consistency.
+
+### What was changed in each next notebook to improve implementation
+Below is the practical transition logic from one notebook to the next:
+
+- **NB1 → NB2**
+  - Added better scheduler/logging structure and multi-seed evaluation pattern.
+  - Goal: improve monitoring and make comparisons more reliable.
+
+- **NB2 → NB3**
+  - Added mass-target normalization and tuned training behavior.
+  - Goal: recover performance and improve feature scaling behavior.
+
+- **NB3 → NB3_v6**
+  - Strengthened pretraining and extended fine-tuning strategy.
+  - Goal: improve representation quality before supervised learning.
+
+- **NB3_v6 → NB4**
+  - Consolidated improvements and tested seeded robustness more strictly.
+  - Goal: ensure gains are stable, not just single-run effects.
+
+- **NB4 → NB6 (Final)**
+  - Polished full benchmark pipeline and optimization settings.
+  - Goal: maximize final score while preserving reproducibility.
 
 ---
 
@@ -103,34 +141,19 @@ The final iteration tracks these integrated decisions:
 
 ---
 
-## Visual journey (with context)
-Images are retained, but organized by purpose so they support the story.
+## Visual journey (curated)
+To keep this README content-first, only the most useful images are kept below.
 
-### 1) Architecture and pipeline understanding
-These figures explain *what is being built* and *how data/model flow is structured*.
-
+### Core architecture view
 ![Architecture](images/architecture.png)
-![Feature engineering and architecture](images/feature%20engineering%20and%20model%20archi.png)
-![Training flowchart](images/training%20flowchart.png)
-![Evaluation metrics flowchart](images/evaluation%20metrics%20flowchart.png)
 
-### 2) Optimization and performance behavior
-These plots show *how training behaves* and *how outcomes compare*.
-
+### Training behavior and evaluation quality
 ![Pretraining curves](images/pretraining_curves.png)
 ![Finetuning curves](images/finetuning_curves.png)
 ![Per-class metrics](images/per_class_metrics.png)
 ![Multi-seed comparison](images/multiseed_comparison.png)
-![Gate analysis](images/gate_analysis.png)
 
-### 3) Project planning and progress artifacts
-These visuals capture *roadmap thinking* and *evolution milestones*.
-
-![Proposal architecture](images/proposal_architecture.png)
-![Proposal timeline](images/proposal_timeline.png)
-![Proposal notebook progress](images/proposal_notebook_progress.png)
-![Six key improvements](images/Six%20Key%20Improvements.png)
-![Data distribution and reproducibility](images/Data%20Distribution%20%26%20Reproducibility%20.png)
+These figures are enough to understand model design, learning dynamics, and reproducibility without overwhelming the page.
 
 ---
 
@@ -177,3 +200,14 @@ External context used in project framing:
 This repository demonstrates an end-to-end experimental journey from baseline hybrid modeling to a stronger final benchmark, with evidence that MAE pretraining improves both **performance** and **stability**.
 
 The final notebook result (`0.7020` accuracy, `0.9536` macro AUC) is best understood not as a one-off number, but as the endpoint of iterative design, ablation validation, and multi-seed reliability analysis.
+
+## Next steps for the next notebook
+The next notebook can focus on fewer but higher-impact experiments. A good direction is to improve class imbalance handling and calibration while preserving the current stability gains.
+
+Suggested next-step points:
+- add class-balanced or focal-style loss comparison,
+- test stronger augmentation for hard classes only,
+- run confidence calibration checks (ECE/reliability plots),
+- include error analysis by confusion clusters,
+- benchmark inference speed/memory with batch-size sweeps,
+- keep the same multi-seed protocol so improvements stay comparable.

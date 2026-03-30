@@ -131,7 +131,12 @@ From `notebook/4-Hybrid_Lorentz_ParT_MAE_JetClass_GSoC2026.ipynb` multi-seed sum
   - `test_acc = 0.6866 ± 0.0059`
   - `test_auc_ovr = 0.9490 ± 0.0014`
 
-Key point: pretraining improves both average performance and run-to-run stability.
+What this shows:
+- Pretraining increases the **mean** score (both accuracy and AUC).
+- Pretraining also reduces **variance** across random seeds, especially for accuracy.
+- The gap in standard deviation (`±0.0013` vs `±0.0059`) supports the claim that MAE pretraining is not only better, but also more stable to initialization.
+
+![Multi-seed comparison](images/multiseed_comparison.png)
 
 ---
 
@@ -140,7 +145,15 @@ From final notebook ablation outputs:
 - `with_mae_pretrain`: `val_acc = 0.5961`, `val_auc = 0.919528`
 - `no_mae_pretrain`: `val_acc = 0.5726`, `val_auc = 0.911468`
 
-These ablations are consistent with final test trends and support the core project claim that MAE pretraining helps downstream classification quality.
+Interpretation from ablation sections:
+- The MAE branch gives a consistent validation lift before final test evaluation.
+- Validation trends align with the final test summary (`+0.0282` accuracy and `+0.0070` AUC in the final notebook report), so the effect is not isolated to one metric.
+- The ablation is used as a control check: keeping the core supervised setup similar while toggling pretraining isolates representation-learning impact.
+
+Relevant training evidence:
+
+![Pretraining curves](images/pretraining_curves.png)
+![Finetuning curves](images/finetuning_curves.png)
 
 ---
 
@@ -152,34 +165,21 @@ The final pipeline integrates:
 - optional mass-regression study branch,
 - engineering optimizations (`torch.compile`, cuDNN benchmark usage in final notebook).
 
----
+Notebook-section design notes:
+- **Input/modeling intent:** particle-level features are modeled with transformer-style interactions to capture inter-particle dependencies.
+- **Fusion intent:** attention-gated combination is used to blend branch information while keeping useful complementary signals.
+- **Training strategy:** two-stage flow (self-supervised pretraining → supervised fine-tuning) is kept explicit and measured with comparable evaluation blocks.
+- **Evaluation discipline:** model selection and reporting emphasize macro AUC + accuracy with seeded checks and per-class inspection instead of a single scalar score.
 
-## Visual notebook journey
-### Proposal and planning visuals
-![Proposal Architecture](images/proposal_architecture.png)
-![Proposal Timeline](images/proposal_timeline.png)
-![Notebook Progress Plan](images/proposal_notebook_progress.png)
-![Six Key Improvements](<images/Six Key Improvements.png>)
-
-### Data and feature/training pipeline views
-![Data Distribution & Reproducibility](<images/Data Distribution & Reproducibility .png>)
-![Feature Engineering and Model Architecture](<images/feature engineering and model archi.png>)
-![Training Flowchart](<images/training flowchart.png>)
-![Evaluation Metrics Flowchart](<images/evaluation metrics flowchart.png>)
-
-### Core architecture and performance evidence
 ![Architecture](images/architecture.png)
 ![Gate Analysis](images/gate_analysis.png)
-![Pretraining curves](images/pretraining_curves.png)
-![Finetuning curves](images/finetuning_curves.png)
 ![Per-class metrics](images/per_class_metrics.png)
-![Multi-seed comparison](images/multiseed_comparison.png)
 
 ---
 
 ## Repository structure
 - `notebook/` — complete notebook lifecycle from baseline to final benchmark
-- `images/` — all plots and explanatory figures used in this README
+- `images/` — selected relevant figures referenced across analysis sections in this README
 - `Research paper/` — local reference PDFs
 - `README.md` — notebook-driven narrative summary
 - `readme (2).md` — format/style reference used for this README rewrite

@@ -40,6 +40,60 @@ High-level flow followed in the notebooks:
 
 This progression is what produced the final performance jump and improved consistency.
 
+### Detailed section-wise content (from final notebook only)
+From `notebook/6-Hybrid_LorentzParT_MAE_GSoC2026_FINAL -.ipynb`, the workflow is explicitly organized as:
+
+- **SECTION 1 — INTRODUCTION & MOTIVATION**
+  - Frames jet tagging at the LHC as the core problem and states why stronger background rejection improves analysis sensitivity.
+  - Explains why self-supervised pretraining is used before supervised labels, and reports the corrected pretraining impact compared with prior work.
+  - Gives component-level motivation table: ParT, Lorentz blocks, Class Attention, MAE, VICReg, attention-gated fusion, and `torch.compile`/cuDNN acceleration.
+  - Lists concrete “Improvements Over GSoC 2025” across features, normalization, reconstruction loss, architecture, pooling, speed, and evaluation protocol.
+
+- **SECTION 2 — SETUP / SECTION 2b — SPEED & REGULARISATION HELPERS**
+  - Standardizes reproducible setup and training environment.
+  - Integrates drop-in speed toggles and VICReg regularization helpers from the final notebook pipeline.
+  - Notes compile fallback behavior where `torch.compile` may revert to eager mode when Triton is unavailable.
+
+- **SECTION 3 — DATA UNDERSTANDING / SECTION 4 — ROOT DATA LOADING**
+  - Documents data inspection and loading path before modeling.
+  - Keeps event-level preparation and split flow aligned with the 100k-event benchmark used for reporting.
+
+- **SECTION 5 — FEATURE ENGINEERING**
+  - Uses particle features: `px, py, pz, E`, `pt, eta, phi`, `charge`, `valid_mask`.
+  - Builds ParT-style pairwise features: `ln(Delta)`, `ln(kT)`, `ln(z)`, `ln(m^2)`.
+  - Includes numerical safeguards (`eps`, clamping, NaN/Inf cleanup) and log-normalized kinematics.
+
+- **SECTION 6 — MASKED AUTOENCODER PRETRAINING DATA PIPELINE**
+  - Defines masked-particle reconstruction pipeline used to learn representations before supervised jet tagging.
+
+- **SECTION 7 — MODEL DESIGN / SECTION 7b — ARCHITECTURE OVERVIEW**
+  - Implements hybrid ParT + Lorentz-aware branch design with attention-gated fusion.
+  - Uses CLS-token style decision pathway with class-attention blocks in the supervised head.
+  - Provides full architecture overview from particle 4-vectors to jet class output.
+
+- **SECTION 8 — LOSS FUNCTIONS**
+  - Uses physics-aware reconstruction objective details highlighted in notebook narrative (Smooth-L1, angular handling for `phi`, weighted feature reconstruction).
+
+- **SECTION 9 — TRAINING UTILITIES**
+  - Organizes schedulers, checkpoint logic, and training helpers used across pretraining and fine-tuning.
+
+- **SECTION 10 — EVALUATION METRICS**
+  - Emphasizes macro AUC and accuracy as primary metrics for selection and reporting.
+
+- **SECTION 11 — PRETRAINING RUN / SECTION 12 — FINE-TUNING RUN**
+  - Runs two-stage training: MAE pretraining first, then supervised fine-tuning.
+  - Uses validation macro AUC (OvR) as primary selector; if AUC is undefined (`NaN`) for an epoch, selection falls back to validation accuracy for stability.
+
+- **SECTION 13 — ABLATION STUDY (+ Multi-seed statistical evaluation)**
+  - Quantifies hybridization gain (ParT-only vs Lorentz-only vs gated hybrid).
+  - Quantifies MAE effect (with pretraining vs from scratch).
+  - Runs multi-seed reporting as mean ± std to avoid cherry-picked single-run claims.
+  - Notes short-run ablations are for relative comparison while final reported model uses full schedule.
+
+- **SECTION 14b — MASS REGRESSION RESULTS**
+  - Adds optional multi-task mass regression branch via `cfg.USE_AUX_MASS = True`.
+  - States this extension directly addresses the GSoC 2026 requirement to include particle mass regression.
+
 ---
 
 ## Notebook-derived project explanation
